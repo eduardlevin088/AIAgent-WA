@@ -1,0 +1,52 @@
+name: Deploy to Server
+
+on:
+  push:
+    branches:
+      - main
+      - uat
+
+jobs:
+  deploy-main:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy main to server
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USERNAME }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: ${{ secrets.SERVER_PORT}}
+          script: |
+            cd /var/www/AIAgent-WA
+            mkdir -p /var/data/AIAgent-WA/media
+            git checkout main
+            git pull
+            docker stop samsonite-bot-wa || true
+            docker rm samsonite-bot-wa || true
+            docker build --no-cache -t samsonite-bot-wa .
+            docker run -d -p 127.0.0.1:8000:8000 -v /var/data/AIAgent-WA:/data --name samsonite-bot-wa --env-file .env samsonite-bot-wa
+
+  deploy-uat:
+    if: github.ref == 'refs/heads/uat'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy UAT to server
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USERNAME }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: ${{ secrets.SERVER_PORT}}
+          script: |
+            cd /var/www/AIAgent-WA-test
+            mkdir -p /var/data/AIAgent-WA-test/media
+            git checkout uat
+            git pull
+            docker stop samsonite-bot-wa-test || true
+            docker rm samsonite-bot-wa-test || true
+            docker build --no-cache -t samsonite-bot-wa-test .
+            docker run -d -p 127.0.0.1:8001:8000 -v /var/data/AIAgent-WA-test:/data --name samsonite-bot-wa-test --env-file .env samsonite-bot-wa-test

@@ -1,0 +1,334 @@
+{% extends "admin_base.html" %}
+
+{% block title %}Заявки на ремонт{% endblock %}
+
+{% block head %}
+<style>
+    .stats {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+        gap: 10px;
+        margin-bottom: 16px;
+    }
+
+    .stat {
+        display: grid;
+        gap: 7px;
+        min-height: 84px;
+        padding: 14px;
+        color: inherit;
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        text-decoration: none;
+        transition: border-color 120ms ease, background 120ms ease;
+    }
+
+    .stat:hover,
+    .stat.is-active {
+        background: var(--surface-strong);
+        border-color: var(--accent);
+    }
+
+    .stat-label {
+        color: var(--muted);
+        font-size: 13px;
+    }
+
+    .stat-value {
+        font-size: 28px;
+        font-weight: 760;
+        line-height: 1;
+    }
+
+    .filters {
+        display: grid;
+        grid-template-columns: minmax(220px, 1fr) 210px auto auto;
+        gap: 10px;
+        align-items: center;
+        padding: 14px;
+        margin-bottom: 16px;
+    }
+
+    .table-wrap {
+        overflow-x: auto;
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+    }
+
+    table {
+        width: 100%;
+        min-width: 1180px;
+        border-collapse: collapse;
+    }
+
+    th,
+    td {
+        padding: 13px 14px;
+        border-bottom: 1px solid var(--line);
+        text-align: left;
+        vertical-align: top;
+    }
+
+    th {
+        position: sticky;
+        top: 0;
+        z-index: 1;
+        color: var(--muted);
+        background: var(--surface);
+        font-size: 12px;
+        font-weight: 650;
+        text-transform: uppercase;
+    }
+
+    tr:last-child td {
+        border-bottom: 0;
+    }
+
+    tbody tr {
+        transition: background 120ms ease;
+    }
+
+    tbody tr:hover {
+        background: #faf6eb;
+    }
+
+    .request-number {
+        font-weight: 760;
+        white-space: nowrap;
+    }
+
+    .status-pill {
+        display: inline-flex;
+        align-items: center;
+        min-height: 26px;
+        padding: 0 9px;
+        border-radius: 999px;
+        color: var(--accent);
+        background: rgba(15, 111, 104, 0.1);
+        font-size: 12px;
+        font-weight: 700;
+        white-space: nowrap;
+    }
+
+    .client {
+        display: grid;
+        gap: 4px;
+        min-width: 160px;
+    }
+
+    .client strong {
+        font-size: 14px;
+    }
+
+    .small {
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.35;
+    }
+
+    .service,
+    .problem {
+        max-width: 250px;
+        line-height: 1.35;
+    }
+
+    .problem {
+        color: #303236;
+    }
+
+    .status-form {
+        display: grid;
+        grid-template-columns: 138px auto;
+        gap: 8px;
+        align-items: center;
+        min-width: 235px;
+    }
+
+    .status-form select {
+        min-height: 34px;
+    }
+
+    .status-form button {
+        min-height: 34px;
+        padding: 0 10px;
+    }
+
+    .empty {
+        display: grid;
+        place-items: center;
+        min-height: 240px;
+        padding: 30px;
+        text-align: center;
+    }
+
+    .empty h2 {
+        margin: 0 0 8px;
+        font-size: 22px;
+    }
+
+    @media (max-width: 1100px) {
+        .filters {
+            grid-template-columns: 1fr 180px auto auto;
+        }
+    }
+
+    @media (max-width: 760px) {
+        .stat {
+            min-height: 74px;
+            padding: 12px;
+        }
+
+        .stat-value {
+            font-size: 24px;
+        }
+
+        .filters {
+            grid-template-columns: 1fr;
+        }
+
+        .filters button,
+        .filters .button {
+            width: 100%;
+        }
+    }
+</style>
+{% endblock %}
+
+{% block body %}
+<div class="shell">
+    {% include "_admin_topbar.html" %}
+
+    <main class="page">
+        <section class="page-heading" aria-labelledby="applications-title">
+            <div>
+                <h1 id="applications-title">Заявки</h1>
+                <p>Рабочая очередь обращений из WhatsApp: клиент, изделие, проблема, оценка и текущий статус.</p>
+            </div>
+        </section>
+
+        <nav class="stats" aria-label="Фильтр по статусу">
+            <a class="stat {% if not selected_status %}is-active{% endif %}" href="/admin/applications{% if q %}?q={{ q|urlencode }}{% endif %}">
+                <span class="stat-label">Все</span>
+                <span class="stat-value">{{ stats.get("Все", 0) }}</span>
+            </a>
+            {% for status in statuses %}
+                <a class="stat {% if selected_status == status %}is-active{% endif %}" href="/admin/applications?status={{ status|urlencode }}{% if q %}&q={{ q|urlencode }}{% endif %}">
+                    <span class="stat-label">{{ status }}</span>
+                    <span class="stat-value">{{ stats.get(status, 0) }}</span>
+                </a>
+            {% endfor %}
+        </nav>
+
+        <form class="filters panel" method="get" action="/admin/applications">
+            <input name="q" value="{{ q }}" placeholder="Поиск: номер, телефон, имя, город, артикул, проблема">
+            <select name="status" aria-label="Статус">
+                <option value="">Все статусы</option>
+                {% for status in statuses %}
+                    <option value="{{ status }}" {% if selected_status == status %}selected{% endif %}>{{ status }}</option>
+                {% endfor %}
+            </select>
+            <button type="submit">Найти</button>
+            <a class="button secondary" href="/admin/applications">Сбросить</a>
+        </form>
+
+        {% if applications %}
+            {% set next_url = current_path ~ ("?" ~ current_query if current_query else "") %}
+            <section class="table-wrap" aria-label="Список заявок">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Заявка</th>
+                            <th>Статус</th>
+                            <th>Клиент</th>
+                            <th>Услуга и изделие</th>
+                            <th>Проблема</th>
+                            <th>Оценка</th>
+                            <th>Bitrix</th>
+                            <th>Создана</th>
+                            <th>Изменить статус</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for app in applications %}
+                            <tr>
+                                <td>
+                                    <div class="request-number">№{{ app.request_number or app.id }}</div>
+                                    <div class="small">WA {{ app.user_id or "не указан" }}</div>
+                                </td>
+                                <td><span class="status-pill">{{ app.status or "Без статуса" }}</span></td>
+                                <td>
+                                    <div class="client">
+                                        <strong>{{ app.name or "Имя не указано" }}</strong>
+                                        <span class="small">{{ app.phone or app.user_id or "телефон не указан" }}</span>
+                                        <span class="small">{{ app.city or "город не указан" }}</span>
+                                    </div>
+                                </td>
+                                <td>
+                                    <div class="service">
+                                        <strong>{{ app.service_type or "услуга не указана" }}</strong>
+                                        <div class="small">
+                                            {{ app.brand or "бренд не указан" }}
+                                            {% if app.model %} · {{ app.model }}{% endif %}
+                                        </div>
+                                        {% if app.article %}
+                                            <div class="small">арт. {{ app.article }}</div>
+                                        {% endif %}
+                                        {% if app.product_type %}
+                                            <div class="small">{{ app.product_type }}</div>
+                                        {% endif %}
+                                    </div>
+                                </td>
+                                <td>
+                                    <div class="problem">{{ app.problem or "описание не заполнено" }}</div>
+                                    {% if app.diagnostic_summary %}
+                                        <div class="small" style="margin-top: 6px;">{{ app.diagnostic_summary }}</div>
+                                    {% endif %}
+                                </td>
+                                <td>
+                                    <span>{{ app.estimated_price_range or "не указана" }}</span>
+                                    {% if app.convenient_time %}
+                                        <div class="small">удобно: {{ app.convenient_time }}</div>
+                                    {% endif %}
+                                </td>
+                                <td>
+                                    {% if app.deal_id %}
+                                        <span class="request-number">#{{ app.deal_id }}</span>
+                                    {% else %}
+                                        <span class="small">нет сделки</span>
+                                    {% endif %}
+                                </td>
+                                <td>
+                                    <span>{{ app.created_at }}</span>
+                                    {% if app.updated_at and app.updated_at != app.created_at %}
+                                        <div class="small">обновлено {{ app.updated_at }}</div>
+                                    {% endif %}
+                                </td>
+                                <td>
+                                    <form class="status-form" method="post" action="/admin/applications/{{ app.id }}/status">
+                                        <input type="hidden" name="next" value="{{ next_url }}">
+                                        <select name="status" aria-label="Новый статус заявки {{ app.request_number or app.id }}">
+                                            {% for status in statuses %}
+                                                <option value="{{ status }}" {% if app.status == status %}selected{% endif %}>{{ status }}</option>
+                                            {% endfor %}
+                                        </select>
+                                        <button type="submit">OK</button>
+                                    </form>
+                                </td>
+                            </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </section>
+        {% else %}
+            <section class="panel empty" aria-live="polite">
+                <div>
+                    <h2>Заявок не найдено</h2>
+                    <p class="muted">Измените фильтр или дождитесь первой заявки из WhatsApp.</p>
+                </div>
+            </section>
+        {% endif %}
+    </main>
+</div>
+{% endblock %}

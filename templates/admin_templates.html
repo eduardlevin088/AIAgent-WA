@@ -1,0 +1,86 @@
+{% extends "admin_base.html" %}
+
+{% block title %}Шаблоны{% endblock %}
+
+{% block head %}
+<style>
+    .template-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 14px;
+    }
+
+    .template-card {
+        display: grid;
+        gap: 12px;
+        padding: 16px;
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+    }
+
+    .template-card header {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 12px;
+    }
+
+    .template-card h2 {
+        margin: 0;
+        font-size: 18px;
+        line-height: 1.2;
+    }
+
+    .stage-code {
+        color: var(--muted);
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 12px;
+        white-space: nowrap;
+    }
+
+    .message-preview {
+        min-height: 140px;
+        padding: 14px;
+        color: #2d2f32;
+        background: var(--surface-strong);
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        line-height: 1.45;
+        white-space: pre-line;
+    }
+
+    @media (max-width: 900px) {
+        .template-grid {
+            grid-template-columns: 1fr;
+        }
+    }
+</style>
+{% endblock %}
+
+{% block body %}
+<div class="shell">
+    {% include "_admin_topbar.html" %}
+
+    <main class="page">
+        <section class="page-heading" aria-labelledby="templates-title">
+            <div>
+                <h1 id="templates-title">Шаблоны</h1>
+                <p>Тексты уведомлений, которые бот отправляет клиенту при смене этапа сделки в Bitrix.</p>
+            </div>
+        </section>
+
+        <section class="template-grid" aria-label="Шаблоны уведомлений">
+            {% for item in notification_templates %}
+                <article class="template-card">
+                    <header>
+                        <h2>{{ item.stage_name }}</h2>
+                        <span class="stage-code">{{ item.stage_id }}</span>
+                    </header>
+                    <div class="message-preview">{{ item.text }}</div>
+                </article>
+            {% endfor %}
+        </section>
+    </main>
+</div>
+{% endblock %}

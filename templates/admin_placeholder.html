@@ -1,0 +1,79 @@
+{% extends "admin_base.html" %}
+
+{% block title %}{{ title }}{% endblock %}
+
+{% block head %}
+<style>
+    .placeholder-grid {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 360px;
+        gap: 16px;
+        align-items: start;
+    }
+
+    .placeholder-panel {
+        padding: 20px;
+    }
+
+    .planned-list {
+        display: grid;
+        gap: 10px;
+        margin: 16px 0 0;
+        padding: 0;
+        list-style: none;
+    }
+
+    .planned-list li {
+        padding: 12px;
+        background: var(--surface-strong);
+        border: 1px solid var(--line);
+        border-radius: 7px;
+    }
+
+    .status-note {
+        padding: 16px;
+        background: rgba(173, 95, 0, 0.08);
+        border: 1px solid rgba(173, 95, 0, 0.18);
+        border-radius: var(--radius);
+    }
+
+    @media (max-width: 900px) {
+        .placeholder-grid {
+            grid-template-columns: 1fr;
+        }
+    }
+</style>
+{% endblock %}
+
+{% block body %}
+<div class="shell">
+    {% include "_admin_topbar.html" %}
+
+    <main class="page">
+        <section class="page-heading" aria-labelledby="placeholder-title">
+            <div>
+                <div class="title-row">
+                    <h1 id="placeholder-title">{{ title }}</h1>
+                    <span class="page-badge">В разработке</span>
+                </div>
+                <p>{{ description }}</p>
+            </div>
+        </section>
+
+        <section class="placeholder-grid">
+            <div class="panel placeholder-panel">
+                <h2 style="margin: 0 0 10px; font-size: 22px;">Планируемый состав</h2>
+                <ul class="planned-list">
+                    {% for item in planned_items %}
+                        <li>{{ item }}</li>
+                    {% endfor %}
+                </ul>
+            </div>
+
+            <aside class="status-note">
+                <strong>Раздел будет включен после базового запуска заявок, шаблонов и статистики.</strong>
+            </aside>
+        </section>
+    </main>
+</div>
+{% endblock %}

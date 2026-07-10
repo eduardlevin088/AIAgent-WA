@@ -1,0 +1,149 @@
+{% extends "admin_base.html" %}
+
+{% block title %}Статистика{% endblock %}
+
+{% block head %}
+<style>
+    .metrics {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 12px;
+        margin-bottom: 16px;
+    }
+
+    .metric {
+        padding: 16px;
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+    }
+
+    .metric-label {
+        display: block;
+        color: var(--muted);
+        font-size: 13px;
+    }
+
+    .metric-value {
+        display: block;
+        margin-top: 8px;
+        font-size: 30px;
+        font-weight: 760;
+        line-height: 1;
+    }
+
+    .content-grid {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 360px;
+        gap: 16px;
+        align-items: start;
+    }
+
+    .status-list,
+    .export-panel,
+    .analytics-panel {
+        padding: 16px;
+    }
+
+    .status-row {
+        display: grid;
+        grid-template-columns: 150px minmax(0, 1fr) 60px;
+        gap: 10px;
+        align-items: center;
+        min-height: 38px;
+        border-bottom: 1px solid var(--line);
+    }
+
+    .status-row:last-child {
+        border-bottom: 0;
+    }
+
+    .bar {
+        height: 8px;
+        overflow: hidden;
+        background: #e4ded2;
+        border-radius: 999px;
+    }
+
+    .bar span {
+        display: block;
+        height: 100%;
+        background: var(--accent);
+        border-radius: inherit;
+    }
+
+    .analytics-panel {
+        margin-top: 16px;
+    }
+
+    .analytics-panel pre {
+        margin: 0;
+        overflow-x: auto;
+        color: #2f3337;
+        font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+        white-space: pre-wrap;
+    }
+
+    @media (max-width: 980px) {
+        .metrics,
+        .content-grid {
+            grid-template-columns: 1fr;
+        }
+    }
+</style>
+{% endblock %}
+
+{% block body %}
+<div class="shell">
+    {% include "_admin_topbar.html" %}
+
+    <main class="page">
+        <section class="page-heading" aria-labelledby="statistics-title">
+            <div>
+                <h1 id="statistics-title">Статистика</h1>
+                <p>Сводка по заявкам, статусам и событиям бота.</p>
+            </div>
+            <a class="button" href="/admin/statistics/export.csv">Экспорт CSV</a>
+        </section>
+
+        <section class="metrics" aria-label="Ключевые показатели">
+            <div class="metric">
+                <span class="metric-label">Всего заявок</span>
+                <span class="metric-value">{{ stats.get("Все", 0) }}</span>
+            </div>
+            <div class="metric">
+                <span class="metric-label">В работе</span>
+                <span class="metric-value">{{ stats.get("В работе", 0) }}</span>
+            </div>
+            <div class="metric">
+                <span class="metric-label">Готовы</span>
+                <span class="metric-value">{{ stats.get("Готов", 0) }}</span>
+            </div>
+        </section>
+
+        <section class="content-grid">
+            <div class="panel status-list">
+                {% for row in status_rows %}
+                    <div class="status-row">
+                        <strong>{{ row.status }}</strong>
+                        <div class="bar" aria-label="{{ row.status }} {{ row.percent }}%">
+                            <span style="width: {{ row.percent }}%;"></span>
+                        </div>
+                        <span>{{ row.count }}</span>
+                    </div>
+                {% endfor %}
+            </div>
+
+            <aside class="panel export-panel">
+                <h2 style="margin: 0 0 8px; font-size: 20px;">Экспорт</h2>
+                <p class="muted" style="margin: 0 0 14px;">CSV содержит заявки, клиентов, статусы, оценку, сделку Bitrix и даты.</p>
+                <a class="button" href="/admin/statistics/export.csv">Скачать файл</a>
+            </aside>
+        </section>
+
+        <section class="panel analytics-panel" aria-label="События бота">
+            <pre>{{ analytics_summary }}</pre>
+        </section>
+    </main>
+</div>
+{% endblock %}

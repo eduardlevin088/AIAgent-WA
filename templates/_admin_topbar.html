@@ -1,0 +1,27 @@
+<header class="topbar">
+    <div class="brand">
+        <div class="brand-mark">S</div>
+        <div>
+            <p class="brand-title">Samsonite Service</p>
+            <p class="brand-subtitle">панель оператора</p>
+        </div>
+    </div>
+
+    <nav class="admin-nav" aria-label="Разделы админки">
+        {% for section in admin_sections %}
+            <a class="nav-link {% if active_section == section.id %}is-active{% endif %}" href="{{ section.href }}">
+                <span>{{ section.label }}</span>
+                {% if section.status %}
+                    <span class="nav-badge">{{ section.status }}</span>
+                {% endif %}
+            </a>
+        {% endfor %}
+    </nav>
+
+    <div class="topbar-actions">
+        <span>{{ admin.username }} · {{ admin.role }}</span>
+        <form method="post" action="/admin/logout">
+            <button class="secondary" type="submit">Выйти</button>
+        </form>
+    </div>
+</header>

@@ -1,0 +1,91 @@
+{% extends "admin_base.html" %}
+
+{% block title %}Вход в админку{% endblock %}
+
+{% block head %}
+<style>
+    .login-wrap {
+        display: grid;
+        place-items: center;
+        min-height: 100vh;
+        padding: 24px;
+    }
+
+    .login-card {
+        width: min(420px, 100%);
+        padding: 28px;
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+    }
+
+    .login-card h1 {
+        margin: 0;
+        font-size: 30px;
+        line-height: 1.05;
+        letter-spacing: 0;
+    }
+
+    .login-card p {
+        margin: 8px 0 24px;
+        color: var(--muted);
+        line-height: 1.45;
+    }
+
+    .login-form {
+        display: grid;
+        gap: 14px;
+    }
+
+    .field {
+        display: grid;
+        gap: 7px;
+    }
+
+    .field label {
+        color: var(--muted);
+        font-size: 13px;
+    }
+
+    .login-form button {
+        width: 100%;
+        margin-top: 4px;
+    }
+</style>
+{% endblock %}
+
+{% block body %}
+<main class="login-wrap">
+    <section class="login-card" aria-labelledby="login-title">
+        <div class="brand" style="margin-bottom: 22px;">
+            <div class="brand-mark">S</div>
+            <div>
+                <p class="brand-title">Samsonite Service</p>
+                <p class="brand-subtitle">панель оператора</p>
+            </div>
+        </div>
+
+        <h1 id="login-title">Вход</h1>
+        <p>Заявки, статусы и рабочая очередь сервисного центра.</p>
+
+        <form class="login-form" method="post" action="/admin/login">
+            <input type="hidden" name="next" value="{{ next_url }}">
+            {% if error %}
+                <div class="error" role="alert">{{ error }}</div>
+            {% endif %}
+
+            <div class="field">
+                <label for="username">Логин</label>
+                <input id="username" name="username" autocomplete="username" value="{{ username }}" required autofocus>
+            </div>
+
+            <div class="field">
+                <label for="password">Пароль</label>
+                <input id="password" name="password" type="password" autocomplete="current-password" required>
+            </div>
+
+            <button type="submit">Войти</button>
+        </form>
+    </section>
+</main>
+{% endblock %}
