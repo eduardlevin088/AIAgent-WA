@@ -389,7 +389,7 @@ async def notify_customer_about_bitrix_status(
     request_number = application.get("request_number")
     text = bitrix_stage_notification_text(stage_id)
     if not text:
-        text = status_notification_text(str(new_status), str(request_number) if request_number else None)
+        return False
     try:
         await wazzup.send_text(
             chat_id=str(user_id),
