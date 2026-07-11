@@ -568,6 +568,36 @@ def repair_status_stat_rows(stats: dict[str, int]) -> list[dict[str, Any]]:
     ]
 
 
+def repair_request_columns(applications: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = {status: [] for status in REPAIR_REQUEST_STATUSES}
+    unknown_statuses: dict[str, list[dict[str, Any]]] = {}
+
+    for application in applications:
+        status = (application.get("status") or "Без статуса").strip() or "Без статуса"
+        if status in grouped:
+            grouped[status].append(application)
+        else:
+            unknown_statuses.setdefault(status, []).append(application)
+
+    columns = [
+        {
+            "status": status,
+            "applications": grouped[status],
+            "count": len(grouped[status]),
+        }
+        for status in REPAIR_REQUEST_STATUSES
+    ]
+    columns.extend(
+        {
+            "status": status,
+            "applications": items,
+            "count": len(items),
+        }
+        for status, items in unknown_statuses.items()
+    )
+    return columns
+
+
 async def ensure_conversation(user: ChatUser) -> str:
     conversation = await get_user_conversation(user.id)
     if conversation:
@@ -1220,20 +1250,17 @@ async def admin_applications(request: Request):
     if not admin:
         return admin_login_redirect(request)
 
-    status = (request.query_params.get("status") or "").strip()
     q = (request.query_params.get("q") or "").strip()
-    if status not in REPAIR_REQUEST_STATUSES:
-        status = ""
 
-    applications = await list_repair_requests(status=status or None, q=q or None)
+    applications = await list_repair_requests(q=q or None)
     stats = await get_repair_request_stats()
     context = admin_template_context(request, admin, "applications")
     context.update(
         {
             "applications": applications,
+            "application_columns": repair_request_columns(applications),
             "stats": stats,
             "statuses": REPAIR_REQUEST_STATUSES,
-            "selected_status": status,
             "q": q,
             "current_path": str(request.url.path),
             "current_query": str(request.url.query),

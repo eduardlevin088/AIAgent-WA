@@ -4,94 +4,125 @@
 
 {% block head %}
 <style>
-    .stats {
+    .summary-strip {
         display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+        grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
         gap: 10px;
         margin-bottom: 16px;
     }
 
-    .stat {
+    .summary-item {
         display: grid;
         gap: 7px;
-        min-height: 84px;
-        padding: 14px;
-        color: inherit;
+        min-height: 76px;
+        padding: 13px;
         background: var(--surface);
         border: 1px solid var(--line);
         border-radius: var(--radius);
-        text-decoration: none;
-        transition: border-color 120ms ease, background 120ms ease;
     }
 
-    .stat:hover,
-    .stat.is-active {
-        background: var(--surface-strong);
-        border-color: var(--accent);
-    }
-
-    .stat-label {
+    .summary-label {
         color: var(--muted);
         font-size: 13px;
     }
 
-    .stat-value {
-        font-size: 28px;
+    .summary-value {
+        font-size: 26px;
         font-weight: 760;
         line-height: 1;
     }
 
     .filters {
         display: grid;
-        grid-template-columns: minmax(220px, 1fr) 210px auto auto;
+        grid-template-columns: minmax(240px, 1fr) auto auto;
         gap: 10px;
         align-items: center;
         padding: 14px;
         margin-bottom: 16px;
     }
 
-    .table-wrap {
+    .board-wrap {
         overflow-x: auto;
-        background: var(--surface);
+        padding-bottom: 8px;
+    }
+
+    .status-board {
+        display: grid;
+        grid-template-columns: repeat({{ application_columns|length }}, minmax(280px, 1fr));
+        gap: 12px;
+        min-width: max(100%, {{ application_columns|length * 292 }}px);
+        align-items: start;
+    }
+
+    .status-column {
+        display: grid;
+        grid-template-rows: auto minmax(220px, 1fr);
+        min-height: 420px;
+        background: rgba(255, 253, 248, 0.72);
         border: 1px solid var(--line);
         border-radius: var(--radius);
     }
 
-    table {
-        width: 100%;
-        min-width: 1180px;
-        border-collapse: collapse;
-    }
-
-    th,
-    td {
-        padding: 13px 14px;
-        border-bottom: 1px solid var(--line);
-        text-align: left;
-        vertical-align: top;
-    }
-
-    th {
-        position: sticky;
-        top: 0;
-        z-index: 1;
-        color: var(--muted);
+    .column-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        min-height: 50px;
+        padding: 12px 13px;
         background: var(--surface);
-        font-size: 12px;
-        font-weight: 650;
-        text-transform: uppercase;
+        border-bottom: 1px solid var(--line);
+        border-radius: var(--radius) var(--radius) 0 0;
     }
 
-    tr:last-child td {
-        border-bottom: 0;
+    .column-title {
+        min-width: 0;
+        margin: 0;
+        font-size: 15px;
+        font-weight: 760;
+        line-height: 1.2;
     }
 
-    tbody tr {
-        transition: background 120ms ease;
+    .column-count {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 28px;
+        height: 28px;
+        padding: 0 8px;
+        color: var(--accent);
+        background: rgba(15, 111, 104, 0.1);
+        border-radius: 999px;
+        font-size: 13px;
+        font-weight: 760;
     }
 
-    tbody tr:hover {
-        background: #faf6eb;
+    .column-body {
+        display: grid;
+        align-content: start;
+        gap: 10px;
+        padding: 10px;
+    }
+
+    .lead-card {
+        display: grid;
+        gap: 10px;
+        padding: 12px;
+        background: var(--surface-strong);
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        box-shadow: 0 1px 0 rgba(32, 33, 36, 0.03);
+    }
+
+    .lead-card:hover {
+        border-color: rgba(15, 111, 104, 0.35);
+    }
+
+    .lead-top {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 10px;
     }
 
     .request-number {
@@ -99,27 +130,24 @@
         white-space: nowrap;
     }
 
-    .status-pill {
-        display: inline-flex;
-        align-items: center;
-        min-height: 26px;
-        padding: 0 9px;
-        border-radius: 999px;
-        color: var(--accent);
-        background: rgba(15, 111, 104, 0.1);
+    .lead-date {
+        color: var(--muted);
         font-size: 12px;
-        font-weight: 700;
-        white-space: nowrap;
+        line-height: 1.35;
+        text-align: right;
     }
 
     .client {
         display: grid;
         gap: 4px;
-        min-width: 160px;
+        min-width: 0;
     }
 
-    .client strong {
+    .client strong,
+    .lead-section strong {
+        color: var(--ink);
         font-size: 14px;
+        line-height: 1.25;
     }
 
     .small {
@@ -128,34 +156,49 @@
         line-height: 1.35;
     }
 
-    .service,
+    .lead-section {
+        display: grid;
+        gap: 4px;
+        min-width: 0;
+    }
+
     .problem {
-        max-width: 250px;
+        display: -webkit-box;
+        overflow: hidden;
+        color: #303236;
+        line-height: 1.35;
+        -webkit-line-clamp: 4;
+        -webkit-box-orient: vertical;
+    }
+
+    .lead-meta {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        padding-top: 2px;
+        color: var(--muted);
+        font-size: 12px;
         line-height: 1.35;
     }
 
-    .problem {
-        color: #303236;
+    .bitrix-link {
+        font-weight: 700;
+        white-space: nowrap;
     }
 
-    .status-form {
+    .empty-column {
         display: grid;
-        grid-template-columns: 138px auto;
-        gap: 8px;
-        align-items: center;
-        min-width: 235px;
+        place-items: center;
+        min-height: 160px;
+        padding: 18px;
+        color: var(--muted);
+        text-align: center;
+        border: 1px dashed var(--line);
+        border-radius: var(--radius);
     }
 
-    .status-form select {
-        min-height: 34px;
-    }
-
-    .status-form button {
-        min-height: 34px;
-        padding: 0 10px;
-    }
-
-    .empty {
+    .empty-page {
         display: grid;
         place-items: center;
         min-height: 240px;
@@ -163,25 +206,30 @@
         text-align: center;
     }
 
-    .empty h2 {
+    .empty-page h2 {
         margin: 0 0 8px;
         font-size: 22px;
     }
 
-    @media (max-width: 1100px) {
-        .filters {
-            grid-template-columns: 1fr 180px auto auto;
+    @media (max-width: 900px) {
+        .status-board {
+            grid-template-columns: 1fr;
+            min-width: 0;
+        }
+
+        .status-column {
+            min-height: auto;
         }
     }
 
     @media (max-width: 760px) {
-        .stat {
-            min-height: 74px;
+        .summary-item {
+            min-height: 70px;
             padding: 12px;
         }
 
-        .stat-value {
-            font-size: 24px;
+        .summary-value {
+            font-size: 23px;
         }
 
         .filters {
@@ -191,6 +239,16 @@
         .filters button,
         .filters .button {
             width: 100%;
+        }
+
+        .lead-top,
+        .lead-meta {
+            align-items: flex-start;
+            flex-direction: column;
+        }
+
+        .lead-date {
+            text-align: left;
         }
     }
 </style>
@@ -204,128 +262,99 @@
         <section class="page-heading" aria-labelledby="applications-title">
             <div>
                 <h1 id="applications-title">Заявки</h1>
-                <p>Рабочая очередь обращений из WhatsApp: клиент, изделие, проблема, оценка и текущий статус.</p>
+                <p>Рабочая очередь обращений из WhatsApp, сгруппированная по текущему статусу.</p>
             </div>
         </section>
 
-        <nav class="stats" aria-label="Фильтр по статусу">
-            <a class="stat {% if not selected_status %}is-active{% endif %}" href="/admin/applications{% if q %}?q={{ q|urlencode }}{% endif %}">
-                <span class="stat-label">Все</span>
-                <span class="stat-value">{{ stats.get("Все", 0) }}</span>
-            </a>
+        <section class="summary-strip" aria-label="Сводка по статусам">
+            <div class="summary-item">
+                <span class="summary-label">Все</span>
+                <span class="summary-value">{{ stats.get("Все", 0) }}</span>
+            </div>
             {% for status in statuses %}
-                <a class="stat {% if selected_status == status %}is-active{% endif %}" href="/admin/applications?status={{ status|urlencode }}{% if q %}&q={{ q|urlencode }}{% endif %}">
-                    <span class="stat-label">{{ status }}</span>
-                    <span class="stat-value">{{ stats.get(status, 0) }}</span>
-                </a>
+                <div class="summary-item">
+                    <span class="summary-label">{{ status }}</span>
+                    <span class="summary-value">{{ stats.get(status, 0) }}</span>
+                </div>
             {% endfor %}
-        </nav>
+        </section>
 
         <form class="filters panel" method="get" action="/admin/applications">
             <input name="q" value="{{ q }}" placeholder="Поиск: номер, телефон, имя, город, артикул, проблема">
-            <select name="status" aria-label="Статус">
-                <option value="">Все статусы</option>
-                {% for status in statuses %}
-                    <option value="{{ status }}" {% if selected_status == status %}selected{% endif %}>{{ status }}</option>
-                {% endfor %}
-            </select>
             <button type="submit">Найти</button>
             <a class="button secondary" href="/admin/applications">Сбросить</a>
         </form>
 
         {% if applications %}
-            {% set next_url = current_path ~ ("?" ~ current_query if current_query else "") %}
-            <section class="table-wrap" aria-label="Список заявок">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Заявка</th>
-                            <th>Статус</th>
-                            <th>Клиент</th>
-                            <th>Услуга и изделие</th>
-                            <th>Проблема</th>
-                            <th>Оценка</th>
-                            <th>Bitrix</th>
-                            <th>Создана</th>
-                            <th>Изменить статус</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {% for app in applications %}
-                            <tr>
-                                <td>
-                                    <div class="request-number">№{{ app.request_number or app.id }}</div>
-                                    <div class="small">WA {{ app.user_id or "не указан" }}</div>
-                                </td>
-                                <td><span class="status-pill">{{ app.status or "Без статуса" }}</span></td>
-                                <td>
-                                    <div class="client">
-                                        <strong>{{ app.name or "Имя не указано" }}</strong>
-                                        <span class="small">{{ app.phone or app.user_id or "телефон не указан" }}</span>
-                                        <span class="small">{{ app.city or "город не указан" }}</span>
-                                    </div>
-                                </td>
-                                <td>
-                                    <div class="service">
-                                        <strong>{{ app.service_type or "услуга не указана" }}</strong>
-                                        <div class="small">
-                                            {{ app.brand or "бренд не указан" }}
-                                            {% if app.model %} · {{ app.model }}{% endif %}
-                                        </div>
-                                        {% if app.article %}
-                                            <div class="small">арт. {{ app.article }}</div>
-                                        {% endif %}
-                                        {% if app.product_type %}
-                                            <div class="small">{{ app.product_type }}</div>
-                                        {% endif %}
-                                    </div>
-                                </td>
-                                <td>
-                                    <div class="problem">{{ app.problem or "описание не заполнено" }}</div>
-                                    {% if app.diagnostic_summary %}
-                                        <div class="small" style="margin-top: 6px;">{{ app.diagnostic_summary }}</div>
-                                    {% endif %}
-                                </td>
-                                <td>
-                                    <span>{{ app.estimated_price_range or "не указана" }}</span>
-                                    {% if app.convenient_time %}
-                                        <div class="small">удобно: {{ app.convenient_time }}</div>
-                                    {% endif %}
-                                </td>
-                                <td>
-                                    {% if app.deal_id %}
-                                        <span class="request-number">#{{ app.deal_id }}</span>
-                                    {% else %}
-                                        <span class="small">нет сделки</span>
-                                    {% endif %}
-                                </td>
-                                <td>
-                                    <span>{{ app.created_at }}</span>
-                                    {% if app.updated_at and app.updated_at != app.created_at %}
-                                        <div class="small">обновлено {{ app.updated_at }}</div>
-                                    {% endif %}
-                                </td>
-                                <td>
-                                    <form class="status-form" method="post" action="/admin/applications/{{ app.id }}/status">
-                                        <input type="hidden" name="next" value="{{ next_url }}">
-                                        <select name="status" aria-label="Новый статус заявки {{ app.request_number or app.id }}">
-                                            {% for status in statuses %}
-                                                <option value="{{ status }}" {% if app.status == status %}selected{% endif %}>{{ status }}</option>
-                                            {% endfor %}
-                                        </select>
-                                        <button type="submit">OK</button>
-                                    </form>
-                                </td>
-                            </tr>
-                        {% endfor %}
-                    </tbody>
-                </table>
+            <section class="board-wrap" aria-label="Заявки по статусам">
+                <div class="status-board">
+                    {% for column in application_columns %}
+                        <section class="status-column" aria-labelledby="column-{{ loop.index }}">
+                            <header class="column-header">
+                                <h2 class="column-title" id="column-{{ loop.index }}">{{ column.status }}</h2>
+                                <span class="column-count">{{ column.count }}</span>
+                            </header>
+
+                            <div class="column-body">
+                                {% if column.applications %}
+                                    {% for app in column.applications %}
+                                        <article class="lead-card">
+                                            <div class="lead-top">
+                                                <div>
+                                                    <div class="request-number">№{{ app.request_number or app.id }}</div>
+                                                    <div class="small">WA {{ app.user_id or "не указан" }}</div>
+                                                </div>
+                                                <time class="lead-date">{{ app.created_at }}</time>
+                                            </div>
+
+                                            <div class="client">
+                                                <strong>{{ app.name or "Имя не указано" }}</strong>
+                                                <span class="small">{{ app.phone or app.user_id or "телефон не указан" }}</span>
+                                                <span class="small">{{ app.city or "город не указан" }}</span>
+                                            </div>
+
+                                            <div class="lead-section">
+                                                <strong>{{ app.service_type or "Услуга не указана" }}</strong>
+                                                <span class="small">
+                                                    {{ app.brand or "бренд не указан" }}
+                                                    {% if app.model %} · {{ app.model }}{% endif %}
+                                                    {% if app.article %} · арт. {{ app.article }}{% endif %}
+                                                </span>
+                                                {% if app.product_type %}
+                                                    <span class="small">{{ app.product_type }}</span>
+                                                {% endif %}
+                                            </div>
+
+                                            <div class="lead-section">
+                                                <div class="problem">{{ app.problem or "описание не заполнено" }}</div>
+                                                {% if app.diagnostic_summary %}
+                                                    <span class="small">{{ app.diagnostic_summary }}</span>
+                                                {% endif %}
+                                            </div>
+
+                                            <div class="lead-meta">
+                                                <span>{{ app.estimated_price_range or "оценка не указана" }}</span>
+                                                {% if app.deal_id %}
+                                                    <span class="bitrix-link">Bitrix #{{ app.deal_id }}</span>
+                                                {% else %}
+                                                    <span>нет сделки</span>
+                                                {% endif %}
+                                            </div>
+                                        </article>
+                                    {% endfor %}
+                                {% else %}
+                                    <div class="empty-column">Нет заявок</div>
+                                {% endif %}
+                            </div>
+                        </section>
+                    {% endfor %}
+                </div>
             </section>
         {% else %}
-            <section class="panel empty" aria-live="polite">
+            <section class="panel empty-page" aria-live="polite">
                 <div>
                     <h2>Заявок не найдено</h2>
-                    <p class="muted">Измените фильтр или дождитесь первой заявки из WhatsApp.</p>
+                    <p class="muted">Измените поиск или дождитесь первой заявки из WhatsApp.</p>
                 </div>
             </section>
         {% endif %}
