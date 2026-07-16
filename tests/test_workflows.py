@@ -159,28 +159,101 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         requested_at = database.parse_utc_timestamp(handoff["requested_at"])
         responded_at = (requested_at + timedelta(seconds=75)).isoformat()
 
-        response = await database.record_operator_response(
+        await database.set_bot_paused("77000000000", True, "Waiting for manager")
+        response = await database.record_operator_message(
             user_id="77000000000",
             manager_message_id="manager-message-1",
             manager_id="crm-user-1",
             manager_name="Manager",
             responded_at=responded_at,
         )
-        duplicate = await database.record_operator_response(
+        duplicate = await database.record_operator_message(
             user_id="77000000000",
             manager_message_id="manager-message-1",
             manager_id="crm-user-1",
             manager_name="Manager",
             responded_at=responded_at,
+        )
+        second_message_at = (requested_at + timedelta(seconds=120)).isoformat()
+        second_message = await database.record_operator_message(
+            user_id="77000000000",
+            manager_message_id="manager-message-2",
+            manager_id="crm-user-1",
+            manager_name="Manager",
+            responded_at=second_message_at,
+        )
+        not_expired = await database.close_expired_operator_handoffs(
+            timeout_minutes=1,
+            now=requested_at + timedelta(seconds=179),
+        )
+        expired = await database.close_expired_operator_handoffs(
+            timeout_minutes=1,
+            now=requested_at + timedelta(seconds=181),
         )
         stats = await database.get_operator_handoff_stats()
 
         self.assertIsNotNone(response)
+        self.assertEqual(response["status"], "active")
         self.assertEqual(response["response_time_seconds"], 75)
+        self.assertTrue(response["first_response_recorded"])
         self.assertIsNone(duplicate)
+        self.assertEqual(second_message["last_manager_message_at"], second_message_at)
+        self.assertFalse(second_message["first_response_recorded"])
+        self.assertEqual(not_expired, [])
+        self.assertEqual(len(expired), 1)
+        self.assertFalse(await database.is_bot_paused("77000000000"))
         self.assertEqual(stats["answered"], 1)
         self.assertEqual(stats["waiting"], 0)
+        self.assertEqual(stats["active"], 0)
         self.assertEqual(stats["average_seconds"], 75.0)
+
+    async def test_manager_can_take_over_without_agent_handoff(self):
+        message_at = database.utc_now_iso()
+        takeover = await database.record_operator_message(
+            user_id="77000000000",
+            manager_message_id="manager-takeover-1",
+            manager_id="crm-user-1",
+            manager_name="Manager",
+            responded_at=message_at,
+        )
+
+        self.assertEqual(takeover["initiated_by"], "manager")
+        self.assertEqual(takeover["status"], "active")
+        self.assertEqual(takeover["last_manager_message_at"], message_at)
+        self.assertIsNone(takeover["response_time_seconds"])
+
+    async def test_manager_webhook_pauses_chat_and_deduplicates_status_updates(self):
+        first_message_at = database.parse_utc_timestamp(database.utc_now_iso())
+        original_is_allowed_chat = bot.is_allowed_chat
+        bot.is_allowed_chat = lambda _: True
+        try:
+            message = {
+                "messageId": "manager-webhook-1",
+                "chatId": "77000000000",
+                "type": "text",
+                "text": "Я подключился",
+                "authorId": "crm-user-1",
+                "authorName": "Manager",
+                "dateTime": first_message_at.isoformat(),
+            }
+            await bot.process_manager_outbound_message(message)
+            await bot.process_manager_outbound_message({
+                **message,
+                "dateTime": (first_message_at + timedelta(minutes=5)).isoformat(),
+            })
+
+            async with database.db.execute("""
+                SELECT COUNT(*) AS total, last_manager_message_at
+                FROM operator_handoffs
+                WHERE user_id = ?
+            """, ("77000000000",)) as cursor:
+                handoff = await cursor.fetchone()
+        finally:
+            bot.is_allowed_chat = original_is_allowed_chat
+
+        self.assertTrue(await database.is_bot_paused("77000000000"))
+        self.assertEqual(handoff["total"], 1)
+        self.assertEqual(handoff["last_manager_message_at"], first_message_at.isoformat())
 
     def test_wazzup_echo_identifies_manager_outbound_message(self):
         self.assertTrue(bot.is_manager_outbound_message({

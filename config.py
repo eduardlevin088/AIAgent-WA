@@ -19,6 +19,14 @@ LIMIT_PER_USER = int(os.getenv("LIMIT_PER_USER"))
 ABSOLUTE_LIMIT = int(os.getenv("ABSOLUTE_LIMIT"))
 
 KZ_UTC = int(os.getenv("KZ_UTC"))
+MANAGER_HANDOFF_TIMEOUT_MINUTES = max(
+    1,
+    int(os.getenv("MANAGER_HANDOFF_TIMEOUT_MINUTES") or 30),
+)
+MANAGER_HANDOFF_POLL_SECONDS = max(
+    1,
+    int(os.getenv("MANAGER_HANDOFF_POLL_SECONDS") or 15),
+)
 
 _admin_ids_raw = (os.getenv("ADMIN_IDS") or "").strip()
 ADMIN_IDS = [

@@ -1,5 +1,6 @@
+import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Sequence
 
 import aiosqlite
@@ -11,6 +12,7 @@ from prettytable import PrettyTable
 logger = logging.getLogger(__name__)
 
 db: Optional[aiosqlite.Connection] = None
+_handoff_operation_lock = asyncio.Lock()
 
 
 async def init_db():
@@ -151,19 +153,42 @@ async def create_tables():
             user_id TEXT NOT NULL,
             reason TEXT,
             summary TEXT,
+            initiated_by TEXT NOT NULL DEFAULT 'agent',
             status TEXT NOT NULL DEFAULT 'waiting',
             requested_at TIMESTAMP NOT NULL,
             first_manager_response_at TIMESTAMP,
+            last_manager_message_at TIMESTAMP,
             response_time_seconds INTEGER,
             manager_message_id TEXT UNIQUE,
             manager_id TEXT,
             manager_name TEXT,
-            closed_at TIMESTAMP
+            closed_at TIMESTAMP,
+            closed_reason TEXT
         )
     """)
+    await ensure_column(
+        "operator_handoffs",
+        "initiated_by",
+        "initiated_by TEXT NOT NULL DEFAULT 'agent'",
+    )
+    await ensure_column(
+        "operator_handoffs",
+        "last_manager_message_at",
+        "last_manager_message_at TIMESTAMP",
+    )
+    await ensure_column(
+        "operator_handoffs",
+        "closed_reason",
+        "closed_reason TEXT",
+    )
     await db.execute("""
         CREATE INDEX IF NOT EXISTS idx_operator_handoffs_user_status
         ON operator_handoffs (user_id, status, requested_at DESC)
+    """)
+    await db.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_operator_handoffs_one_open_per_user
+        ON operator_handoffs (user_id)
+        WHERE status IN ('waiting', 'active')
     """)
 
     await db.execute("""
@@ -684,7 +709,7 @@ async def create_operator_handoff(
     async with db.execute("""
         SELECT *
         FROM operator_handoffs
-        WHERE user_id = ? AND status = 'waiting'
+        WHERE user_id = ? AND status IN ('waiting', 'active')
         ORDER BY requested_at DESC, id DESC
         LIMIT 1
     """, (user_id,)) as cursor:
@@ -710,7 +735,35 @@ async def create_operator_handoff(
     }
 
 
-async def record_operator_response(
+async def record_operator_message(
+    user_id: str,
+    manager_message_id: str | None,
+    manager_id: str | None,
+    manager_name: str | None,
+    responded_at: str | None,
+) -> dict | None:
+    async with _handoff_operation_lock:
+        return await _record_operator_message(
+            user_id=user_id,
+            manager_message_id=manager_message_id,
+            manager_id=manager_id,
+            manager_name=manager_name,
+            responded_at=responded_at,
+        )
+
+
+async def _pause_bot_for_manager(user_id: str) -> None:
+    await db.execute("""
+        INSERT INTO bot_state (user_id, is_paused, reason, updated_at)
+        VALUES (?, 1, 'Менеджер ведет диалог', CURRENT_TIMESTAMP)
+        ON CONFLICT(user_id) DO UPDATE SET
+            is_paused = 1,
+            reason = 'Менеджер ведет диалог',
+            updated_at = CURRENT_TIMESTAMP
+    """, (user_id,))
+
+
+async def _record_operator_message(
     user_id: str,
     manager_message_id: str | None,
     manager_id: str | None,
@@ -730,55 +783,183 @@ async def record_operator_response(
     async with db.execute("""
         SELECT *
         FROM operator_handoffs
-        WHERE user_id = ? AND status = 'waiting'
+        WHERE user_id = ? AND status IN ('waiting', 'active')
         ORDER BY requested_at DESC, id DESC
         LIMIT 1
     """, (user_id,)) as cursor:
         handoff = await cursor.fetchone()
 
-    if not handoff:
-        return None
-
-    requested_dt = parse_utc_timestamp(handoff["requested_at"])
     responded_dt = parse_utc_timestamp(responded_at)
-    if responded_dt < requested_dt:
-        return None
-
-    response_time_seconds = max(0, round((responded_dt - requested_dt).total_seconds()))
     normalized_responded_at = responded_dt.isoformat()
+
+    if not handoff:
+        cursor = await db.execute("""
+            INSERT INTO operator_handoffs (
+                user_id, reason, summary, initiated_by, status,
+                requested_at, first_manager_response_at, last_manager_message_at,
+                manager_message_id, manager_id, manager_name
+            )
+            VALUES (?, ?, ?, 'manager', 'active', ?, ?, ?, ?, ?, ?)
+        """, (
+            user_id,
+            "Менеджер подключился к диалогу",
+            "Менеджер прервал автоматический диалог",
+            normalized_responded_at,
+            normalized_responded_at,
+            normalized_responded_at,
+            manager_message_id,
+            manager_id,
+            manager_name,
+        ))
+        await _pause_bot_for_manager(user_id)
+        await db.commit()
+        return {
+            "id": cursor.lastrowid,
+            "user_id": user_id,
+            "initiated_by": "manager",
+            "status": "active",
+            "requested_at": normalized_responded_at,
+            "first_manager_response_at": normalized_responded_at,
+            "last_manager_message_at": normalized_responded_at,
+            "response_time_seconds": None,
+            "manager_message_id": manager_message_id,
+            "manager_id": manager_id,
+            "manager_name": manager_name,
+            "first_response_recorded": False,
+        }
+
+    handoff_data = dict(handoff)
+    if handoff_data["status"] == "waiting":
+        requested_dt = parse_utc_timestamp(handoff_data["requested_at"])
+        if responded_dt < requested_dt:
+            return None
+
+        response_time_seconds = max(0, round((responded_dt - requested_dt).total_seconds()))
+        cursor = await db.execute("""
+            UPDATE operator_handoffs
+            SET status = 'active',
+                first_manager_response_at = ?,
+                last_manager_message_at = ?,
+                response_time_seconds = ?,
+                manager_message_id = ?,
+                manager_id = ?,
+                manager_name = ?
+            WHERE id = ? AND status = 'waiting'
+        """, (
+            normalized_responded_at,
+            normalized_responded_at,
+            response_time_seconds,
+            manager_message_id,
+            manager_id,
+            manager_name,
+            handoff_data["id"],
+        ))
+        if cursor.rowcount <= 0:
+            await db.rollback()
+            return None
+        await _pause_bot_for_manager(user_id)
+        await db.commit()
+
+        handoff_data.update({
+            "status": "active",
+            "first_manager_response_at": normalized_responded_at,
+            "last_manager_message_at": normalized_responded_at,
+            "response_time_seconds": response_time_seconds,
+            "manager_message_id": manager_message_id,
+            "manager_id": manager_id,
+            "manager_name": manager_name,
+            "first_response_recorded": True,
+        })
+        return handoff_data
+
+    previous_message_dt = parse_utc_timestamp(handoff_data.get("last_manager_message_at"))
+    last_manager_message_at = max(previous_message_dt, responded_dt).isoformat()
     cursor = await db.execute("""
         UPDATE operator_handoffs
-        SET status = 'answered',
-            first_manager_response_at = ?,
-            response_time_seconds = ?,
-            manager_message_id = ?,
-            manager_id = ?,
-            manager_name = ?,
-            closed_at = ?
-        WHERE id = ? AND status = 'waiting'
+        SET last_manager_message_at = ?,
+            manager_id = COALESCE(?, manager_id),
+            manager_name = COALESCE(?, manager_name)
+        WHERE id = ? AND status = 'active'
     """, (
-        normalized_responded_at,
-        response_time_seconds,
-        manager_message_id,
+        last_manager_message_at,
         manager_id,
         manager_name,
-        normalized_responded_at,
-        handoff["id"],
+        handoff_data["id"],
     ))
-    await db.commit()
     if cursor.rowcount <= 0:
+        await db.rollback()
         return None
+    await _pause_bot_for_manager(user_id)
+    await db.commit()
 
-    result = dict(handoff)
-    result.update({
-        "status": "answered",
-        "first_manager_response_at": normalized_responded_at,
-        "response_time_seconds": response_time_seconds,
-        "manager_message_id": manager_message_id,
-        "manager_id": manager_id,
-        "manager_name": manager_name,
+    handoff_data.update({
+        "last_manager_message_at": last_manager_message_at,
+        "manager_id": manager_id or handoff_data.get("manager_id"),
+        "manager_name": manager_name or handoff_data.get("manager_name"),
+        "first_response_recorded": False,
     })
-    return result
+    return handoff_data
+
+
+async def close_expired_operator_handoffs(
+    timeout_minutes: int,
+    now: datetime | None = None,
+) -> list[dict]:
+    async with _handoff_operation_lock:
+        return await _close_expired_operator_handoffs(timeout_minutes, now)
+
+
+async def _close_expired_operator_handoffs(
+    timeout_minutes: int,
+    now: datetime | None = None,
+) -> list[dict]:
+    if db is None:
+        raise RuntimeError("Database not initialized")
+
+    current_dt = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    cutoff = (current_dt - timedelta(minutes=timeout_minutes)).isoformat()
+    closed_at = current_dt.isoformat()
+    async with db.execute("""
+        SELECT id, user_id, last_manager_message_at
+        FROM operator_handoffs
+        WHERE status = 'active'
+          AND last_manager_message_at IS NOT NULL
+          AND last_manager_message_at <= ?
+        ORDER BY id
+    """, (cutoff,)) as cursor:
+        candidates = await cursor.fetchall()
+
+    closed: list[dict] = []
+    for candidate in candidates:
+        cursor = await db.execute("""
+            UPDATE operator_handoffs
+            SET status = 'closed',
+                closed_at = ?,
+                closed_reason = 'manager_inactivity_timeout'
+            WHERE id = ?
+              AND status = 'active'
+              AND last_manager_message_at <= ?
+        """, (closed_at, candidate["id"], cutoff))
+        if cursor.rowcount <= 0:
+            continue
+
+        await db.execute("""
+            INSERT INTO bot_state (user_id, is_paused, reason, updated_at)
+            VALUES (?, 0, NULL, CURRENT_TIMESTAMP)
+            ON CONFLICT(user_id) DO UPDATE SET
+                is_paused = 0,
+                reason = NULL,
+                updated_at = CURRENT_TIMESTAMP
+        """, (candidate["user_id"],))
+        closed.append({
+            "id": candidate["id"],
+            "user_id": candidate["user_id"],
+            "last_manager_message_at": candidate["last_manager_message_at"],
+            "closed_at": closed_at,
+        })
+
+    await db.commit()
+    return closed
 
 
 async def cancel_open_operator_handoff(user_id: str) -> int:
@@ -787,8 +968,10 @@ async def cancel_open_operator_handoff(user_id: str) -> int:
 
     cursor = await db.execute("""
         UPDATE operator_handoffs
-        SET status = 'cancelled', closed_at = ?
-        WHERE user_id = ? AND status = 'waiting'
+        SET status = 'cancelled',
+            closed_at = ?,
+            closed_reason = 'manual_resume'
+        WHERE user_id = ? AND status IN ('waiting', 'active')
     """, (utc_now_iso(), user_id))
     await db.commit()
     return cursor.rowcount
@@ -802,9 +985,10 @@ async def get_operator_handoff_stats() -> dict[str, int | float | None]:
         SELECT
             COUNT(*) AS total,
             SUM(CASE WHEN status = 'waiting' THEN 1 ELSE 0 END) AS waiting,
-            SUM(CASE WHEN status = 'answered' THEN 1 ELSE 0 END) AS answered,
-            AVG(CASE WHEN status = 'answered' THEN response_time_seconds END) AS average_seconds,
-            MAX(CASE WHEN status = 'answered' THEN response_time_seconds END) AS maximum_seconds
+            SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active,
+            SUM(CASE WHEN response_time_seconds IS NOT NULL THEN 1 ELSE 0 END) AS answered,
+            AVG(response_time_seconds) AS average_seconds,
+            MAX(response_time_seconds) AS maximum_seconds
         FROM operator_handoffs
     """) as cursor:
         row = await cursor.fetchone()
@@ -812,6 +996,7 @@ async def get_operator_handoff_stats() -> dict[str, int | float | None]:
     return {
         "total": int(row["total"] or 0),
         "waiting": int(row["waiting"] or 0),
+        "active": int(row["active"] or 0),
         "answered": int(row["answered"] or 0),
         "average_seconds": round(float(row["average_seconds"]), 1)
         if row["average_seconds"] is not None else None,

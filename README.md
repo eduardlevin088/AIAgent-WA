@@ -44,6 +44,8 @@ INTERNAL_API_KEY=secret-for-/send-endpoint
 ADMIN_IDS=77000000000,77111111111
 ENABLE_CHAT_ALLOWLIST=1
 ALLOWED_CHAT_IDS=77000000000,77111111111
+MANAGER_HANDOFF_TIMEOUT_MINUTES=30
+MANAGER_HANDOFF_POLL_SECONDS=15
 BITRIX_STAGE_STATUS_MAP={"C5:UC_SRW3R8":"Принят","C5:EXECUTING":"В работе","C5:FINAL_INVOICE":"Готов","C5:WON":"Выдан"}
 ```
 
@@ -63,6 +65,8 @@ Inbound messages from any other WhatsApp number are ignored before the bot logs 
 `BITRIX_STAGE_STATUS_MAP` maps Bitrix deal `STAGE_ID` values to local repair statuses. It is optional; default values cover the service center funnel described in `BITRIX.md`.
 
 `BITRIX_APPLICATION_TOKEN` is optional but recommended. Bitrix sends it as `auth[application_token]` in CRM trigger payloads; when set, `/webhook/bitrix` rejects requests with a different token.
+
+Every distinct human outbound Wazzup message pauses the agent and resets the manager handoff timer. After `MANAGER_HANDOFF_TIMEOUT_MINUTES` without another manager message, the handoff closes and the agent processes future customer messages again. The default is 30 minutes; `MANAGER_HANDOFF_POLL_SECONDS` controls how often expired handoffs are checked.
 
 `DB_PATH` must be a full SQLite file path. If unset, the app uses `./data/database.db`.
 

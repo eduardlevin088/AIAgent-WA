@@ -6,7 +6,7 @@ import json
 import logging
 import re
 import threading
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -21,16 +21,18 @@ from config import ABSOLUTE_LIMIT, ADMIN_IDS, ADMIN_PASSWORD, ADMIN_SESSION_SECR
 from config import ALLOWED_CHAT_IDS, ENABLE_CHAT_ALLOWLIST
 from config import ADMIN_USERNAME, BITRIX_APPLICATION_TOKEN, BITRIX_STAGE_STATUS_MAP
 from config import GPT_MODEL, INTERNAL_API_KEY, LIMIT_PER_USER
+from config import MANAGER_HANDOFF_POLL_SECONDS, MANAGER_HANDOFF_TIMEOUT_MINUTES
 from config import SUPERADMIN_ID, WAZZUP_CHANNEL_ID, WAZZUP_CHAT_TYPE
 from database import add_token_usage, append_dialog_message, cancel_open_operator_handoff
-from database import close_db, count_media_files, create_admin, create_operator_handoff
+from database import close_db, close_expired_operator_handoffs, count_media_files
+from database import create_admin, create_operator_handoff
 from database import create_or_update_user, delete_admin, execute_query, get_admin_ids
 from database import get_admin_user_by_id, get_admin_user_by_username, get_analytics_summary
 from database import get_media_files, get_operator_handoff_stats, get_recent_dialog
 from database import get_repair_request_stats
 from database import get_token_usage, get_user_conversation, get_users, init_db
 from database import is_bot_paused, list_customers, list_repair_requests, log_event, mark_message_processed
-from database import record_operator_response, REPAIR_REQUEST_STATUSES, save_feedback
+from database import record_operator_message, REPAIR_REQUEST_STATUSES, save_feedback
 from database import save_media_file, set_bot_paused
 from database import sync_repair_request_status_by_deal_id, update_repair_request_status
 from database import upsert_admin_user
@@ -81,6 +83,37 @@ class StatusNotificationRequest(BaseModel):
     chat_type: str | None = Field(default=None, alias="chatType")
 
 
+async def manager_handoff_timeout_worker() -> None:
+    while True:
+        try:
+            closed_handoffs = await close_expired_operator_handoffs(
+                MANAGER_HANDOFF_TIMEOUT_MINUTES,
+            )
+            for handoff in closed_handoffs:
+                await log_event(
+                    handoff["user_id"],
+                    "operator_handoff_timeout",
+                    json.dumps({
+                        "handoff_id": handoff["id"],
+                        "last_manager_message_at": handoff["last_manager_message_at"],
+                        "closed_at": handoff["closed_at"],
+                        "timeout_minutes": MANAGER_HANDOFF_TIMEOUT_MINUTES,
+                    }),
+                )
+                logger.info(
+                    "Manager handoff expired: chat_id=%s handoff_id=%s timeout_minutes=%s",
+                    handoff["user_id"],
+                    handoff["id"],
+                    MANAGER_HANDOFF_TIMEOUT_MINUTES,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Failed to close expired manager handoffs")
+
+        await asyncio.sleep(MANAGER_HANDOFF_POLL_SECONDS)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting WhatsApp webhook service...")
@@ -90,9 +123,13 @@ async def lifespan(app: FastAPI):
         await upsert_admin_user(ADMIN_USERNAME, hash_password(ADMIN_PASSWORD), role="superadmin")
     for admin_id in ADMIN_IDS:
         await create_admin(admin_id)
+    handoff_timeout_task = asyncio.create_task(manager_handoff_timeout_worker())
     try:
         yield
     finally:
+        handoff_timeout_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await handoff_timeout_task
         await close_db()
         await wazzup.close()
 
@@ -829,7 +866,10 @@ async def run_agent_and_reply(
         return
 
     await asyncio.sleep(RESPONSE_DEBOUNCE_SECONDS)
-    if not await is_latest_activity(user.id, activity_version):
+    if (
+        not await is_latest_activity(user.id, activity_version)
+        or await is_bot_paused(user.id)
+    ):
         await log_event(user.id, "stale_before_generation", None)
         return
 
@@ -848,7 +888,10 @@ async def run_agent_and_reply(
 
     await add_token_usage(user.id, result["input"], result["output"])
 
-    if not await is_latest_activity(user.id, activity_version):
+    if (
+        not await is_latest_activity(user.id, activity_version)
+        or await is_bot_paused(user.id)
+    ):
         await log_event(user.id, "stale_after_generation", result.get("response_id"))
         return
 
@@ -1170,9 +1213,13 @@ async def process_manager_outbound_message(message: dict[str, Any]) -> None:
     if not chat_id or not is_allowed_chat(chat_id):
         return
 
-    handoff = await record_operator_response(
+    message_id = str(message.get("messageId") or "").strip() or None
+    if message_id and not await mark_message_processed(message_id, chat_id):
+        return
+
+    handoff = await record_operator_message(
         user_id=chat_id,
-        manager_message_id=str(message.get("messageId") or "").strip() or None,
+        manager_message_id=message_id,
         manager_id=str(message.get("authorId") or "").strip() or None,
         manager_name=str(message.get("authorName") or "").strip() or None,
         responded_at=str(message.get("dateTime") or "").strip() or None,
@@ -1180,25 +1227,39 @@ async def process_manager_outbound_message(message: dict[str, Any]) -> None:
     if not handoff:
         return
 
+    await record_user_activity(chat_id)
+
     message_type = str(message.get("type") or "unknown")
     text = message.get("text") or f"[{message_type}]"
     await append_dialog_message(chat_id, "operator", message_type, text)
+    manager_takeover_created = (
+        handoff.get("initiated_by") == "manager"
+        and handoff.get("manager_message_id") == message_id
+    )
+    if manager_takeover_created:
+        event_type = "operator_takeover"
+    elif handoff.get("first_response_recorded"):
+        event_type = "operator_first_response"
+    else:
+        event_type = "operator_message"
     event_payload = {
         "handoff_id": handoff.get("id"),
         "response_time_seconds": handoff.get("response_time_seconds"),
+        "last_manager_message_at": handoff.get("last_manager_message_at"),
         "manager_id": handoff.get("manager_id"),
         "manager_name": handoff.get("manager_name"),
-        "message_id": handoff.get("manager_message_id"),
+        "message_id": message_id,
     }
     await log_event(
         chat_id,
-        "operator_first_response",
+        event_type,
         json.dumps(event_payload, ensure_ascii=False),
     )
     logger.info(
-        "Manager first response recorded: chat_id=%s handoff_id=%s response_time_seconds=%s manager=%s",
+        "Manager message recorded: chat_id=%s handoff_id=%s event=%s response_time_seconds=%s manager=%s",
         chat_id,
         handoff.get("id"),
+        event_type,
         handoff.get("response_time_seconds"),
         handoff.get("manager_name") or handoff.get("manager_id") or "unknown",
     )
