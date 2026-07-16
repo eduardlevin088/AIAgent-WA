@@ -49,7 +49,7 @@ from services.wazzup import DownloadedContent, WazzupClient
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-wazzup = WazzupClient()
+wazzup = WazzupClient(outbound_message_recorder=mark_message_processed)
 REQUEST_MEDIA_LIMIT = 5
 RESPONSE_DEBOUNCE_SECONDS = 1.0
 GENERATION_BUSY_RETRY_ATTEMPTS = 3

@@ -17,6 +17,7 @@ os.environ.setdefault("WAZZUP_CHANNEL_ID", "test-channel")
 
 import bot
 import database
+from services.wazzup import WazzupClient
 
 
 class WorkflowTests(unittest.IsolatedAsyncioTestCase):
@@ -254,6 +255,39 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await database.is_bot_paused("77000000000"))
         self.assertEqual(handoff["total"], 1)
         self.assertEqual(handoff["last_manager_message_at"], first_message_at.isoformat())
+
+    async def test_wazzup_client_registers_api_message_id_before_echo(self):
+        class FakeResponse:
+            status = 201
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return False
+
+            async def text(self):
+                return '{"messageId":"bot-message-1","chatId":"77000000000"}'
+
+            async def json(self):
+                return {
+                    "messageId": "bot-message-1",
+                    "chatId": "77000000000",
+                }
+
+        class FakeSession:
+            def post(self, *args, **kwargs):
+                return FakeResponse()
+
+        recorder = AsyncMock()
+        client = WazzupClient(outbound_message_recorder=recorder)
+        client._session = FakeSession()
+        client.headers = lambda: {}
+
+        result = await client.send_text("77000000000", "Bot reply")
+
+        self.assertEqual(result["messageId"], "bot-message-1")
+        recorder.assert_awaited_once_with("bot-message-1", "77000000000")
 
     def test_wazzup_echo_identifies_manager_outbound_message(self):
         self.assertTrue(bot.is_manager_outbound_message({

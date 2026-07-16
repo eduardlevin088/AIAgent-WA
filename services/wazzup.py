@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from email.message import Message
 from urllib.parse import parse_qs, urlparse
@@ -19,8 +20,12 @@ class DownloadedContent:
 
 
 class WazzupClient:
-    def __init__(self):
+    def __init__(
+        self,
+        outbound_message_recorder: Callable[[str, str], Awaitable[object]] | None = None,
+    ):
         self._session: aiohttp.ClientSession | None = None
+        self._outbound_message_recorder = outbound_message_recorder
 
     async def start(self) -> None:
         if not self._session:
@@ -74,9 +79,14 @@ class WazzupClient:
             if not response_text:
                 return {}
             try:
-                return await response.json()
+                result = await response.json()
             except aiohttp.ContentTypeError:
                 return {"raw": response_text}
+
+            message_id = str(result.get("messageId") or "").strip()
+            if message_id and self._outbound_message_recorder:
+                await self._outbound_message_recorder(message_id, str(payload["chatId"]))
+            return result
 
     async def download_content(self, content_uri: str) -> DownloadedContent:
         async with self.session.get(content_uri) as response:
