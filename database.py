@@ -1,9 +1,10 @@
 import logging
+from datetime import datetime, timezone
 from typing import Optional, Sequence
 
 import aiosqlite
 
-from config import DB_PATH
+from config import BITRIX_BOT_STAGE_ID, BITRIX_STAGE_RANKS, DB_PATH
 from prettytable import PrettyTable
 
 
@@ -145,6 +146,27 @@ async def create_tables():
     """)
 
     await db.execute("""
+        CREATE TABLE IF NOT EXISTS operator_handoffs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            reason TEXT,
+            summary TEXT,
+            status TEXT NOT NULL DEFAULT 'waiting',
+            requested_at TIMESTAMP NOT NULL,
+            first_manager_response_at TIMESTAMP,
+            response_time_seconds INTEGER,
+            manager_message_id TEXT UNIQUE,
+            manager_id TEXT,
+            manager_name TEXT,
+            closed_at TIMESTAMP
+        )
+    """)
+    await db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_operator_handoffs_user_status
+        ON operator_handoffs (user_id, status, requested_at DESC)
+    """)
+
+    await db.execute("""
         CREATE TABLE IF NOT EXISTS repair_requests (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             request_number INTEGER UNIQUE,
@@ -152,6 +174,8 @@ async def create_tables():
             deal_id INTEGER,
             bitrix_contact_id INTEGER,
             status TEXT DEFAULT 'Принят',
+            furthest_bitrix_stage_id TEXT,
+            furthest_bitrix_stage_rank INTEGER,
             service_type TEXT,
             name TEXT,
             phone TEXT,
@@ -169,6 +193,16 @@ async def create_tables():
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    await ensure_column(
+        "repair_requests",
+        "furthest_bitrix_stage_id",
+        "furthest_bitrix_stage_id TEXT",
+    )
+    await ensure_column(
+        "repair_requests",
+        "furthest_bitrix_stage_rank",
+        "furthest_bitrix_stage_rank INTEGER",
+    )
     
     logger.info("Database tables created successfully")
 
@@ -620,6 +654,172 @@ async def log_event(user_id: str | None, event_type: str, payload: str | None = 
     await db.commit()
 
 
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def parse_utc_timestamp(value: str | None) -> datetime:
+    if not value:
+        return datetime.now(timezone.utc)
+
+    normalized = str(value).strip().replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return datetime.now(timezone.utc)
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+async def create_operator_handoff(
+    user_id: str,
+    reason: str | None,
+    summary: str | None,
+) -> dict:
+    if db is None:
+        raise RuntimeError("Database not initialized")
+
+    async with db.execute("""
+        SELECT *
+        FROM operator_handoffs
+        WHERE user_id = ? AND status = 'waiting'
+        ORDER BY requested_at DESC, id DESC
+        LIMIT 1
+    """, (user_id,)) as cursor:
+        existing = await cursor.fetchone()
+
+    if existing:
+        return dict(existing)
+
+    requested_at = utc_now_iso()
+    cursor = await db.execute("""
+        INSERT INTO operator_handoffs (user_id, reason, summary, requested_at)
+        VALUES (?, ?, ?, ?)
+    """, (user_id, reason, summary, requested_at))
+    await db.commit()
+
+    return {
+        "id": cursor.lastrowid,
+        "user_id": user_id,
+        "reason": reason,
+        "summary": summary,
+        "status": "waiting",
+        "requested_at": requested_at,
+    }
+
+
+async def record_operator_response(
+    user_id: str,
+    manager_message_id: str | None,
+    manager_id: str | None,
+    manager_name: str | None,
+    responded_at: str | None,
+) -> dict | None:
+    if db is None:
+        raise RuntimeError("Database not initialized")
+
+    if manager_message_id:
+        async with db.execute("""
+            SELECT id FROM operator_handoffs WHERE manager_message_id = ?
+        """, (manager_message_id,)) as cursor:
+            if await cursor.fetchone():
+                return None
+
+    async with db.execute("""
+        SELECT *
+        FROM operator_handoffs
+        WHERE user_id = ? AND status = 'waiting'
+        ORDER BY requested_at DESC, id DESC
+        LIMIT 1
+    """, (user_id,)) as cursor:
+        handoff = await cursor.fetchone()
+
+    if not handoff:
+        return None
+
+    requested_dt = parse_utc_timestamp(handoff["requested_at"])
+    responded_dt = parse_utc_timestamp(responded_at)
+    if responded_dt < requested_dt:
+        return None
+
+    response_time_seconds = max(0, round((responded_dt - requested_dt).total_seconds()))
+    normalized_responded_at = responded_dt.isoformat()
+    cursor = await db.execute("""
+        UPDATE operator_handoffs
+        SET status = 'answered',
+            first_manager_response_at = ?,
+            response_time_seconds = ?,
+            manager_message_id = ?,
+            manager_id = ?,
+            manager_name = ?,
+            closed_at = ?
+        WHERE id = ? AND status = 'waiting'
+    """, (
+        normalized_responded_at,
+        response_time_seconds,
+        manager_message_id,
+        manager_id,
+        manager_name,
+        normalized_responded_at,
+        handoff["id"],
+    ))
+    await db.commit()
+    if cursor.rowcount <= 0:
+        return None
+
+    result = dict(handoff)
+    result.update({
+        "status": "answered",
+        "first_manager_response_at": normalized_responded_at,
+        "response_time_seconds": response_time_seconds,
+        "manager_message_id": manager_message_id,
+        "manager_id": manager_id,
+        "manager_name": manager_name,
+    })
+    return result
+
+
+async def cancel_open_operator_handoff(user_id: str) -> int:
+    if db is None:
+        raise RuntimeError("Database not initialized")
+
+    cursor = await db.execute("""
+        UPDATE operator_handoffs
+        SET status = 'cancelled', closed_at = ?
+        WHERE user_id = ? AND status = 'waiting'
+    """, (utc_now_iso(), user_id))
+    await db.commit()
+    return cursor.rowcount
+
+
+async def get_operator_handoff_stats() -> dict[str, int | float | None]:
+    if db is None:
+        raise RuntimeError("Database not initialized")
+
+    async with db.execute("""
+        SELECT
+            COUNT(*) AS total,
+            SUM(CASE WHEN status = 'waiting' THEN 1 ELSE 0 END) AS waiting,
+            SUM(CASE WHEN status = 'answered' THEN 1 ELSE 0 END) AS answered,
+            AVG(CASE WHEN status = 'answered' THEN response_time_seconds END) AS average_seconds,
+            MAX(CASE WHEN status = 'answered' THEN response_time_seconds END) AS maximum_seconds
+        FROM operator_handoffs
+    """) as cursor:
+        row = await cursor.fetchone()
+
+    return {
+        "total": int(row["total"] or 0),
+        "waiting": int(row["waiting"] or 0),
+        "answered": int(row["answered"] or 0),
+        "average_seconds": round(float(row["average_seconds"]), 1)
+        if row["average_seconds"] is not None else None,
+        "maximum_seconds": int(row["maximum_seconds"])
+        if row["maximum_seconds"] is not None else None,
+    }
+
+
 async def create_repair_request(
     user_id: str,
     data: dict,
@@ -631,15 +831,19 @@ async def create_repair_request(
 
     cursor = await db.execute("""
         INSERT INTO repair_requests (
-            user_id, deal_id, bitrix_contact_id, service_type, name, phone, city,
+            user_id, deal_id, bitrix_contact_id,
+            furthest_bitrix_stage_id, furthest_bitrix_stage_rank,
+            service_type, name, phone, city,
             product_type, brand, model, article, problem, diagnostic_summary,
             estimated_price_range, warranty_context, convenient_time
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         user_id,
         deal_id,
         bitrix_contact_id,
+        BITRIX_BOT_STAGE_ID,
+        BITRIX_STAGE_RANKS.get(BITRIX_BOT_STAGE_ID.strip().upper()),
         data.get("service_type"),
         data.get("name"),
         data.get("phone"),
@@ -718,6 +922,7 @@ async def list_repair_requests(
     async with db.execute(f"""
         SELECT
             id, request_number, user_id, deal_id, bitrix_contact_id, status,
+            furthest_bitrix_stage_id, furthest_bitrix_stage_rank,
             service_type, name, phone, city, product_type, brand, model, article,
             problem, diagnostic_summary, estimated_price_range, warranty_context,
             convenient_time, created_at, updated_at
@@ -841,14 +1046,19 @@ async def update_repair_request_status_by_deal_id(deal_id: int, status: str) -> 
     return cursor.rowcount
 
 
-async def sync_repair_request_status_by_deal_id(deal_id: int, status: str) -> dict:
+async def sync_repair_request_status_by_deal_id(
+    deal_id: int,
+    status: str,
+    stage_id: str | None = None,
+) -> dict:
     if db is None:
         raise RuntimeError("Database not initialized")
 
     async with db.execute("""
         SELECT
             id, request_number, user_id, deal_id, status, name, phone,
-            service_type, created_at, updated_at
+            service_type, furthest_bitrix_stage_id, furthest_bitrix_stage_rank,
+            created_at, updated_at
         FROM repair_requests
         WHERE deal_id = ?
         ORDER BY id DESC
@@ -863,33 +1073,69 @@ async def sync_repair_request_status_by_deal_id(deal_id: int, status: str) -> di
             "updated": 0,
             "old_status": None,
             "new_status": status,
+            "stage_advanced": False,
+            "furthest_stage_id": None,
+            "furthest_stage_rank": None,
         }
 
     application = dict(row)
     old_status = application.get("status")
-    if old_status == status:
+    normalized_stage_id = stage_id.strip().upper() if stage_id else None
+    stage_rank = BITRIX_STAGE_RANKS.get(normalized_stage_id) if normalized_stage_id else None
+    furthest_stage_id = application.get("furthest_bitrix_stage_id")
+    furthest_stage_rank = application.get("furthest_bitrix_stage_rank")
+    tracking_initialized = furthest_stage_rank is not None
+    stage_advanced = bool(
+        tracking_initialized
+        and stage_rank is not None
+        and stage_rank > int(furthest_stage_rank)
+    )
+    initialize_tracking = not tracking_initialized and stage_rank is not None
+    status_changed = old_status != status
+
+    if stage_advanced or initialize_tracking:
+        furthest_stage_id = normalized_stage_id
+        furthest_stage_rank = stage_rank
+
+    if not status_changed and not stage_advanced and not initialize_tracking:
         return {
             "application": application,
             "changed": False,
             "updated": 0,
             "old_status": old_status,
             "new_status": status,
+            "stage_advanced": False,
+            "furthest_stage_id": furthest_stage_id,
+            "furthest_stage_rank": furthest_stage_rank,
         }
 
     cursor = await db.execute("""
         UPDATE repair_requests
-        SET status = ?, updated_at = CURRENT_TIMESTAMP
+        SET status = ?,
+            furthest_bitrix_stage_id = ?,
+            furthest_bitrix_stage_rank = ?,
+            updated_at = CURRENT_TIMESTAMP
         WHERE id = ?
-    """, (status, application["id"]))
+    """, (
+        status,
+        furthest_stage_id,
+        furthest_stage_rank,
+        application["id"],
+    ))
     await db.commit()
 
     application["status"] = status
+    application["furthest_bitrix_stage_id"] = furthest_stage_id
+    application["furthest_bitrix_stage_rank"] = furthest_stage_rank
     return {
         "application": application,
-        "changed": cursor.rowcount > 0,
+        "changed": status_changed and cursor.rowcount > 0,
         "updated": cursor.rowcount,
         "old_status": old_status,
         "new_status": status,
+        "stage_advanced": stage_advanced,
+        "furthest_stage_id": furthest_stage_id,
+        "furthest_stage_rank": furthest_stage_rank,
     }
 
 

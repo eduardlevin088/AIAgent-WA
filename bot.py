@@ -22,13 +22,16 @@ from config import ALLOWED_CHAT_IDS, ENABLE_CHAT_ALLOWLIST
 from config import ADMIN_USERNAME, BITRIX_APPLICATION_TOKEN, BITRIX_STAGE_STATUS_MAP
 from config import GPT_MODEL, INTERNAL_API_KEY, LIMIT_PER_USER
 from config import SUPERADMIN_ID, WAZZUP_CHANNEL_ID, WAZZUP_CHAT_TYPE
-from database import add_token_usage, append_dialog_message, close_db, count_media_files, create_admin
+from database import add_token_usage, append_dialog_message, cancel_open_operator_handoff
+from database import close_db, count_media_files, create_admin, create_operator_handoff
 from database import create_or_update_user, delete_admin, execute_query, get_admin_ids
 from database import get_admin_user_by_id, get_admin_user_by_username, get_analytics_summary
-from database import get_media_files, get_recent_dialog, get_repair_request_stats
+from database import get_media_files, get_operator_handoff_stats, get_recent_dialog
+from database import get_repair_request_stats
 from database import get_token_usage, get_user_conversation, get_users, init_db
 from database import is_bot_paused, list_customers, list_repair_requests, log_event, mark_message_processed
-from database import REPAIR_REQUEST_STATUSES, save_feedback, save_media_file, set_bot_paused
+from database import record_operator_response, REPAIR_REQUEST_STATUSES, save_feedback
+from database import save_media_file, set_bot_paused
 from database import sync_repair_request_status_by_deal_id, update_repair_request_status
 from database import upsert_admin_user
 from services.agent import generate_response, transcribe
@@ -217,6 +220,15 @@ def is_inbound_customer_message(message: dict[str, Any]) -> bool:
     return message.get("status") == "inbound" and not message.get("isEcho")
 
 
+def is_manager_outbound_message(message: dict[str, Any]) -> bool:
+    return (
+        bool(message.get("isEcho"))
+        and message.get("status") in {"sent", "delivered", "read"}
+        and not message.get("isDeleted")
+        and not message.get("isEdited")
+    )
+
+
 def is_dedicated_wazzup_channel(message: dict[str, Any]) -> bool:
     expected_channel_id = (WAZZUP_CHANNEL_ID or "").strip()
     incoming_channel_id = str(message.get("channelId") or "").strip()
@@ -378,7 +390,7 @@ async def notify_customer_about_bitrix_status(
     channel_id: str | None = None,
 ) -> bool:
     application = sync_result.get("application")
-    if not application or not sync_result.get("changed"):
+    if not application or not sync_result.get("stage_advanced"):
         return False
 
     user_id = application.get("user_id")
@@ -568,6 +580,22 @@ def repair_status_stat_rows(stats: dict[str, int]) -> list[dict[str, Any]]:
     ]
 
 
+def format_duration(seconds: int | float | None) -> str:
+    if seconds is None:
+        return "Нет данных"
+
+    total_seconds = max(0, round(float(seconds)))
+    if total_seconds < 60:
+        return f"{total_seconds} сек"
+
+    minutes, remaining_seconds = divmod(total_seconds, 60)
+    if minutes < 60:
+        return f"{minutes} мин {remaining_seconds} сек"
+
+    hours, remaining_minutes = divmod(minutes, 60)
+    return f"{hours} ч {remaining_minutes} мин"
+
+
 def repair_request_columns(applications: list[dict[str, Any]]) -> list[dict[str, Any]]:
     grouped: dict[str, list[dict[str, Any]]] = {status: [] for status in REPAIR_REQUEST_STATUSES}
     unknown_statuses: dict[str, list[dict[str, Any]]] = {}
@@ -734,11 +762,24 @@ async def handle_handoff(
     chat_type: str,
 ) -> None:
     await set_bot_paused(user.id, True, handoff.get("reason"))
-    await log_event(user.id, "handoff", handoff.get("reason"))
+    handoff_record = await create_operator_handoff(
+        user.id,
+        handoff.get("reason"),
+        handoff.get("summary"),
+    )
+    await log_event(
+        user.id,
+        "handoff",
+        json.dumps({
+            "handoff_id": handoff_record.get("id"),
+            "reason": handoff.get("reason"),
+        }, ensure_ascii=False),
+    )
 
     dialog = await get_recent_dialog(user.id, limit=20)
     admin_text = (
         "Требуется оператор.\n\n"
+        f"Передача: #{handoff_record.get('id')}\n"
         f"Клиент: {user.first_name or user.username}\n"
         f"WhatsApp: {user.id}\n"
         f"Причина: {handoff.get('reason')}\n"
@@ -840,6 +881,7 @@ async def reset_conversation(user: ChatUser, channel_id: str, chat_type: str, ac
         last_name=user.last_name,
         conversation=conversation,
     )
+    await cancel_open_operator_handoff(user.id)
     await set_bot_paused(user.id, False)
 
     system_message = "Пользователь начал диалог. Поприветствуй и скажи куда он обратился на казахском и русском."
@@ -885,6 +927,7 @@ async def handle_command(
         if target_user_id != user.id and not is_superadmin(user.id):
             await wazzup.send_text(user.id, "Insufficient rights", channel_id=channel_id, chat_type=chat_type)
             return True
+        await cancel_open_operator_handoff(target_user_id)
         await set_bot_paused(target_user_id, False)
         await wazzup.send_text(user.id, f"Bot resumed for {target_user_id}", channel_id=channel_id, chat_type=chat_type)
         return True
@@ -1122,8 +1165,51 @@ async def process_audio_message(
     )
 
 
+async def process_manager_outbound_message(message: dict[str, Any]) -> None:
+    chat_id = str(message.get("chatId") or "").strip()
+    if not chat_id or not is_allowed_chat(chat_id):
+        return
+
+    handoff = await record_operator_response(
+        user_id=chat_id,
+        manager_message_id=str(message.get("messageId") or "").strip() or None,
+        manager_id=str(message.get("authorId") or "").strip() or None,
+        manager_name=str(message.get("authorName") or "").strip() or None,
+        responded_at=str(message.get("dateTime") or "").strip() or None,
+    )
+    if not handoff:
+        return
+
+    message_type = str(message.get("type") or "unknown")
+    text = message.get("text") or f"[{message_type}]"
+    await append_dialog_message(chat_id, "operator", message_type, text)
+    event_payload = {
+        "handoff_id": handoff.get("id"),
+        "response_time_seconds": handoff.get("response_time_seconds"),
+        "manager_id": handoff.get("manager_id"),
+        "manager_name": handoff.get("manager_name"),
+        "message_id": handoff.get("manager_message_id"),
+    }
+    await log_event(
+        chat_id,
+        "operator_first_response",
+        json.dumps(event_payload, ensure_ascii=False),
+    )
+    logger.info(
+        "Manager first response recorded: chat_id=%s handoff_id=%s response_time_seconds=%s manager=%s",
+        chat_id,
+        handoff.get("id"),
+        handoff.get("response_time_seconds"),
+        handoff.get("manager_name") or handoff.get("manager_id") or "unknown",
+    )
+
+
 async def process_wazzup_message(message: dict[str, Any]) -> None:
     if not is_dedicated_wazzup_channel(message):
+        return
+
+    if is_manager_outbound_message(message):
+        await process_manager_outbound_message(message)
         return
 
     if not is_inbound_customer_message(message):
@@ -1306,12 +1392,16 @@ async def admin_statistics(request: Request):
         return admin_login_redirect(request)
 
     stats = await get_repair_request_stats()
+    handoff_stats = await get_operator_handoff_stats()
     analytics_summary = await get_analytics_summary()
     context = admin_template_context(request, admin, "statistics")
     context.update(
         {
             "stats": stats,
             "status_rows": repair_status_stat_rows(stats),
+            "handoff_stats": handoff_stats,
+            "average_manager_response": format_duration(handoff_stats.get("average_seconds")),
+            "maximum_manager_response": format_duration(handoff_stats.get("maximum_seconds")),
             "analytics_summary": analytics_summary,
         }
     )
@@ -1496,10 +1586,17 @@ async def bitrix_webhook(request: Request) -> dict[str, Any]:
         "updated": 0,
         "old_status": None,
         "new_status": repair_status,
+        "stage_advanced": False,
+        "furthest_stage_id": None,
+        "furthest_stage_rank": None,
     }
     notification_sent = False
     if deal_id and repair_status:
-        sync_result = await sync_repair_request_status_by_deal_id(deal_id, repair_status)
+        sync_result = await sync_repair_request_status_by_deal_id(
+            deal_id,
+            repair_status,
+            stage_id=stage_id,
+        )
         notification_sent = await notify_customer_about_bitrix_status(sync_result, stage_id=stage_id)
 
     application = sync_result.get("application")
@@ -1512,6 +1609,9 @@ async def bitrix_webhook(request: Request) -> dict[str, Any]:
         "mapped_status": repair_status,
         "old_status": sync_result.get("old_status"),
         "changed": sync_result.get("changed"),
+        "stage_advanced": sync_result.get("stage_advanced"),
+        "furthest_stage_id": sync_result.get("furthest_stage_id"),
+        "furthest_stage_rank": sync_result.get("furthest_stage_rank"),
         "updated": sync_result.get("updated"),
         "notification_sent": notification_sent,
         "request_number": application.get("request_number") if application else None,
@@ -1520,12 +1620,13 @@ async def bitrix_webhook(request: Request) -> dict[str, Any]:
     }
     await log_event(None, "bitrix_stage_webhook", json.dumps(log_payload, ensure_ascii=False))
     logger.info(
-        "Bitrix stage webhook received: deal_id=%s stage_id=%s source=%s mapped_status=%s changed=%s updated=%s notification_sent=%s",
+        "Bitrix stage webhook received: deal_id=%s stage_id=%s source=%s mapped_status=%s changed=%s advanced=%s updated=%s notification_sent=%s",
         deal_id,
         stage_id,
         stage_id_source,
         repair_status,
         sync_result.get("changed"),
+        sync_result.get("stage_advanced"),
         sync_result.get("updated"),
         notification_sent,
     )
@@ -1538,6 +1639,8 @@ async def bitrix_webhook(request: Request) -> dict[str, Any]:
         "mappedStatus": repair_status,
         "oldStatus": sync_result.get("old_status"),
         "changed": sync_result.get("changed"),
+        "stageAdvanced": sync_result.get("stage_advanced"),
+        "furthestStageId": sync_result.get("furthest_stage_id"),
         "updated": sync_result.get("updated"),
         "notificationSent": notification_sent,
         "requestNumber": application.get("request_number") if application else None,

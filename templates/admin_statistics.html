@@ -11,6 +11,15 @@
         margin-bottom: 16px;
     }
 
+    .metrics.metrics--four {
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+    }
+
+    .section-title {
+        margin: 24px 0 10px;
+        font-size: 20px;
+    }
+
     .metric {
         padding: 16px;
         background: var(--surface);
@@ -86,6 +95,7 @@
 
     @media (max-width: 980px) {
         .metrics,
+        .metrics.metrics--four,
         .content-grid {
             grid-template-columns: 1fr;
         }
@@ -118,6 +128,29 @@
             <div class="metric">
                 <span class="metric-label">Готовы</span>
                 <span class="metric-value">{{ stats.get("Готов", 0) }}</span>
+            </div>
+        </section>
+
+        <h2 class="section-title">Работа менеджеров</h2>
+        <section class="metrics metrics--four" aria-label="Статистика передачи менеджерам">
+            <div class="metric">
+                <span class="metric-label">Передано менеджеру</span>
+                <span class="metric-value">{{ handoff_stats.get("total", 0) }}</span>
+            </div>
+            <div class="metric">
+                <span class="metric-label">Получили ответ</span>
+                <span class="metric-value">{{ handoff_stats.get("answered", 0) }}</span>
+            </div>
+            <div class="metric">
+                <span class="metric-label">Ожидают ответа</span>
+                <span class="metric-value">{{ handoff_stats.get("waiting", 0) }}</span>
+            </div>
+            <div class="metric">
+                <span class="metric-label">Среднее время ответа</span>
+                <span class="metric-value">{{ average_manager_response }}</span>
+                {% if handoff_stats.get("maximum_seconds") is not none %}
+                    <span class="metric-label" style="margin-top: 8px;">Максимум: {{ maximum_manager_response }}</span>
+                {% endif %}
             </div>
         </section>
 

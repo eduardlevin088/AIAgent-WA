@@ -43,7 +43,11 @@ tools = [
     {
         "type": "function",
         "name": "handoff_to_operator",
-        "description": "Escalate the dialog to a human operator when the assistant cannot resolve the request or the client asks for a person.",
+        "description": (
+            "Immediately hand the chat to a human manager when the customer's question is outside "
+            "the repair-service script, cannot be answered only from the provided instructions, "
+            "requires current external information, or the customer asks for a person."
+        ),
         "parameters": {
             "type": "object",
             "properties": {

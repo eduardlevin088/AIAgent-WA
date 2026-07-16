@@ -33,6 +33,12 @@ Client status equivalent
 | Успешно | Выдан |
 | Товар отправлен на утилизацию | Передан на утилизацию |
 
+Client notifications are sent only when a deal reaches a stage strictly further than the furthest stage previously recorded for that repair request. Moving a deal backward, or returning it to the previous furthest stage, updates the local status but does not send the notification again.
+
+## Planned
+
+- Import and export all service-funnel deals from Bitrix, including deals not created by the agent.
+
 
 
 Get stage of deal by id:
@@ -42,4 +48,3 @@ response = requests.post(f'{BITRIX_WEBHOOK_URL}crm.item.get', json={"entityTypeI
 
 stageId = response.json()['result']['item']['stageId']
 ```
-

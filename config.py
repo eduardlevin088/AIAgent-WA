@@ -61,6 +61,23 @@ BITRIX_APPLICATION_TOKEN = (os.getenv("BITRIX_APPLICATION_TOKEN") or "").strip()
 BITRIX_SERVICE_CATEGORY_ID = int(os.getenv("BITRIX_SERVICE_CATEGORY_ID") or 5)
 BITRIX_DEAL_ENTITY_TYPE_ID = int(os.getenv("BITRIX_DEAL_ENTITY_TYPE_ID") or 2)
 BITRIX_BOT_STAGE_ID = os.getenv("BITRIX_BOT_STAGE_ID") or "C5:UC_SRW3R8"
+BITRIX_STAGE_SEQUENCE = (
+    "C5:NEW",
+    "C5:UC_SRW3R8",
+    "C5:UC_KG8OHE",
+    "C5:PREPARATION",
+    "C5:PREPAYMENT_INVOICE",
+    "C5:EXECUTING",
+    "C5:UC_QACO2C",
+    "C5:UC_0CWJKY",
+    "C5:FINAL_INVOICE",
+    "C5:WON",
+    "C5:LOSE",
+)
+BITRIX_STAGE_RANKS = {
+    stage_id: rank
+    for rank, stage_id in enumerate(BITRIX_STAGE_SEQUENCE)
+}
 DEFAULT_BITRIX_STAGE_STATUS_MAP = {
     "C5:NEW": "Принят",
     "C5:UC_SRW3R8": "Принят",
