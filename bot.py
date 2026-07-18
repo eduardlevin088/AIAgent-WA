@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field
 from config import ABSOLUTE_LIMIT, ADMIN_IDS, ADMIN_PASSWORD, ADMIN_SESSION_SECRET
 from config import ALLOWED_CHAT_IDS, ENABLE_CHAT_ALLOWLIST
 from config import ADMIN_USERNAME, BITRIX_APPLICATION_TOKEN, BITRIX_STAGE_STATUS_MAP
-from config import GPT_MODEL, INTERNAL_API_KEY, LIMIT_PER_USER
+from config import GPT_MODEL, GREETING_TEXT_PATH, INTERNAL_API_KEY, LIMIT_PER_USER
 from config import MANAGER_HANDOFF_POLL_SECONDS, MANAGER_HANDOFF_TIMEOUT_MINUTES
 from config import SUPERADMIN_ID, WAZZUP_CHANNEL_ID, WAZZUP_CHAT_TYPE
 from database import add_token_usage, append_dialog_message, cancel_open_operator_handoff
@@ -50,6 +50,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 wazzup = WazzupClient(outbound_message_recorder=mark_message_processed)
+GREETING_TEXT = GREETING_TEXT_PATH.read_text(encoding="utf-8").strip()
 REQUEST_MEDIA_LIMIT = 5
 RESPONSE_DEBOUNCE_SECONDS = 1.0
 GENERATION_BUSY_RETRY_ATTEMPTS = 3
@@ -57,6 +58,21 @@ GENERATION_BUSY_RETRY_DELAY_SECONDS = 0.75
 _user_activity_versions: dict[str, int] = {}
 _user_activity_lock = threading.Lock()
 _user_generation_locks: dict[str, asyncio.Lock] = {}
+CUSTOMER_GREETING_PHRASES = {
+    "ассаламу алейкум",
+    "ассалаумагалейкум",
+    "ассалаумағалейкум",
+    "доброе утро",
+    "добрый вечер",
+    "добрый день",
+    "здравствуй",
+    "здравствуйте",
+    "привет",
+    "салем",
+    "салеметсиз бе",
+    "сәлем",
+    "сәлеметсіз бе",
+}
 
 
 @dataclass
@@ -288,6 +304,12 @@ def is_dedicated_wazzup_channel(message: dict[str, Any]) -> bool:
 
 def normalized_chat_id(chat_id: str) -> str:
     return re.sub(r"\D", "", chat_id)
+
+
+def is_customer_greeting(text: str) -> bool:
+    normalized = re.sub(r"[^\w\s]", " ", text.casefold(), flags=re.UNICODE)
+    normalized = " ".join(normalized.split())
+    return normalized in CUSTOMER_GREETING_PHRASES
 
 
 def is_allowed_chat(user_id: str) -> bool:
@@ -927,27 +949,12 @@ async def reset_conversation(user: ChatUser, channel_id: str, chat_type: str, ac
     await cancel_open_operator_handoff(user.id)
     await set_bot_paused(user.id, False)
 
-    system_message = "Пользователь начал диалог. Поприветствуй и скажи куда он обратился на казахском и русском."
-
-    result = await generate_response_serialized(
-        user=user,
-        conversation=conversation,
-        user_message=None,
-        activity_version=activity_version,
-        system_message=system_message,
-    )
-    if result is None:
-        return
-
-    await add_token_usage(user.id, result["input"], result["output"])
-
     if not await is_latest_activity(user.id, activity_version):
-        await log_event(user.id, "stale_reset_response", result.get("response_id"))
+        await log_event(user.id, "stale_reset_response", None)
         return
 
-    if result["response"]:
-        await wazzup.send_text(user.id, result["response"], channel_id=channel_id, chat_type=chat_type)
-        await append_dialog_message(user.id, "assistant", "text", result["response"])
+    await wazzup.send_text(user.id, GREETING_TEXT, channel_id=channel_id, chat_type=chat_type)
+    await append_dialog_message(user.id, "assistant", "text", GREETING_TEXT)
 
 
 async def handle_command(
@@ -1084,6 +1091,10 @@ async def process_text_message(
     activity_version: int,
 ) -> None:
     text = message.get("text") or ""
+    if is_customer_greeting(text):
+        await reset_conversation(user, channel_id, chat_type, activity_version)
+        return
+
     if await maybe_save_feedback(user, text, channel_id, chat_type):
         return
 
@@ -1302,7 +1313,8 @@ async def process_wazzup_message(message: dict[str, Any]) -> None:
 
         if message_type == "text":
             text = message.get("text") or ""
-            if await is_bot_paused(user.id) and not text.startswith(("/start", "/resume")):
+            can_restart = is_customer_greeting(text) or text.startswith(("/start", "/resume"))
+            if await is_bot_paused(user.id) and not can_restart:
                 await log_event(user.id, "message_while_paused", message_id)
                 return
             await process_text_message(user, message, channel_id, chat_type, activity_version)

@@ -129,6 +129,7 @@ The built-in statuses are: `Принят`, `Диагностика`, `В раб�
 - Accepted inbound types: text, image, video, audio.
 - One request can store up to 5 image/video files.
 - Audio is transcribed before being sent to the AI.
+- A greeting-only customer message starts a fresh dialogue and sends the fixed text from `static/greeting.txt` without involving the LLM. Slash commands remain supported for compatibility.
 - `/operator` pauses the bot for that client and sends recent dialog history to admins.
 - `/resume` or `/start` re-enables the bot.
 - Feedback can be sent as `/feedback 5 text` or `оценка 5 text`.

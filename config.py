@@ -54,6 +54,7 @@ ALLOWED_CHAT_IDS = [
 
 STATIC_DIR = BASE_DIR / "static"
 AGENT_PROMPT_MAIN_PATH = STATIC_DIR / "agent_prompt_main.txt"
+GREETING_TEXT_PATH = STATIC_DIR / "greeting.txt"
 PHOTO_PROCESSING_INSTRUCTIONS_PATH = Path(
     os.getenv("PHOTO_PROCESSING_INSTRUCTIONS_PATH") or STATIC_DIR / "photo_processing_instructions.txt"
 )
