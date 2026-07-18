@@ -16,6 +16,7 @@ Required environment variables:
 DB_PATH=/Users/levineduard/HYPER/AIAgent-WA/data/database.db
 WAZZUP_API_KEY=your_wazzup_api_key
 WAZZUP_CHANNEL_ID=your_wazzup_channel_id
+WAZZUP_CHAT_LINK_BASE=https://app.wazzup24.ru/your-account/chat/whatsapp/
 SUPERADMIN_ID=77000000000
 GPT_KEY=...
 GPT_MODEL=...

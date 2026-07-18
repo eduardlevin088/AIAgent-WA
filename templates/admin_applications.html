@@ -150,6 +150,18 @@
         line-height: 1.25;
     }
 
+    .wazzup-chat-link {
+        width: fit-content;
+        color: var(--accent);
+        font-size: 12px;
+        font-weight: 700;
+        text-decoration: none;
+    }
+
+    .wazzup-chat-link:hover {
+        text-decoration: underline;
+    }
+
     .small {
         color: var(--muted);
         font-size: 12px;
@@ -312,6 +324,14 @@
                                                 <strong>{{ app.name or "Имя не указано" }}</strong>
                                                 <span class="small">{{ app.phone or app.user_id or "телефон не указан" }}</span>
                                                 <span class="small">{{ app.city or "город не указан" }}</span>
+                                                {% if app.wazzup_chat_url %}
+                                                    <a
+                                                        class="wazzup-chat-link"
+                                                        href="{{ app.wazzup_chat_url }}"
+                                                        target="_blank"
+                                                        rel="noopener noreferrer"
+                                                    >Чат Wazzup</a>
+                                                {% endif %}
                                             </div>
 
                                             <div class="lead-section">

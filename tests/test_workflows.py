@@ -16,6 +16,10 @@ os.environ.setdefault("LIMIT_PER_USER", "100000")
 os.environ.setdefault("ABSOLUTE_LIMIT", "200000")
 os.environ.setdefault("KZ_UTC", "5")
 os.environ.setdefault("WAZZUP_CHANNEL_ID", "test-channel")
+os.environ.setdefault(
+    "WAZZUP_CHAT_LINK_BASE",
+    "https://app.wazzup24.ru/1298-2527/chat/whatsapp/",
+)
 
 import bot
 import database
@@ -208,6 +212,8 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
     async def test_applications_are_read_only_and_header_uses_registered_name(self):
         await self.create_request()
         applications = await database.list_repair_requests()
+        applications[0]["phone"] = "+7 (700) 000-00-00"
+        applications[0]["wazzup_chat_url"] = bot.build_wazzup_chat_url(applications[0])
 
         html = bot.templates.env.get_template("admin_applications.html").render(
             admin={
@@ -229,6 +235,12 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("/admin/applications/1/status", html)
         self.assertNotIn('name="status"', html)
         self.assertNotIn(">Обновить</button>", html)
+        self.assertIn(
+            f'href="{bot.WAZZUP_CHAT_LINK_BASE}/77000000000/{bot.WAZZUP_CHANNEL_ID}"',
+            html,
+        )
+        self.assertIn('target="_blank"', html)
+        self.assertIn('rel="noopener noreferrer"', html)
 
     async def test_statistics_can_group_applications_by_city(self):
         await self.create_request(deal_id=42, city="Алматы", user_id="77000000001")

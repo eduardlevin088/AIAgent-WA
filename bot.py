@@ -22,7 +22,7 @@ from config import ALLOWED_CHAT_IDS, ENABLE_CHAT_ALLOWLIST
 from config import ADMIN_USERNAME, BITRIX_APPLICATION_TOKEN, BITRIX_STAGE_STATUS_MAP
 from config import GPT_MODEL, GREETING_TEXT_PATH, INTERNAL_API_KEY, LIMIT_PER_USER
 from config import MANAGER_HANDOFF_POLL_SECONDS, MANAGER_HANDOFF_TIMEOUT_MINUTES
-from config import SUPERADMIN_ID, WAZZUP_CHANNEL_ID, WAZZUP_CHAT_TYPE
+from config import SUPERADMIN_ID, WAZZUP_CHANNEL_ID, WAZZUP_CHAT_LINK_BASE, WAZZUP_CHAT_TYPE
 from database import add_token_usage, append_dialog_message, cancel_open_operator_handoff
 from database import close_db, close_expired_operator_handoffs, count_media_files
 from database import create_admin, create_operator_handoff
@@ -250,6 +250,28 @@ def normalize_whatsapp_id(value: str | None) -> str | None:
     if not cleaned.isdigit() or not 7 <= len(cleaned) <= 20:
         raise ValueError("WhatsApp ID должен содержать от 7 до 20 цифр")
     return cleaned
+
+
+def build_wazzup_chat_url(application: dict[str, Any]) -> str | None:
+    channel_id = (WAZZUP_CHANNEL_ID or "").strip()
+    if not WAZZUP_CHAT_LINK_BASE or not channel_id:
+        return None
+
+    phone_number = None
+    for candidate in (application.get("phone"), application.get("user_id")):
+        try:
+            phone_number = normalize_whatsapp_id(str(candidate or ""))
+        except ValueError:
+            continue
+        if phone_number:
+            break
+    if not phone_number:
+        return None
+
+    return (
+        f"{WAZZUP_CHAT_LINK_BASE}/{quote(phone_number, safe='')}"
+        f"/{quote(channel_id, safe='')}"
+    )
 
 
 def admin_login_redirect(request: Request) -> RedirectResponse:
@@ -1405,6 +1427,8 @@ async def admin_applications(request: Request):
     q = (request.query_params.get("q") or "").strip()
 
     applications = await list_repair_requests(q=q or None)
+    for application in applications:
+        application["wazzup_chat_url"] = build_wazzup_chat_url(application)
     stats = await get_repair_request_stats()
     context = admin_template_context(request, admin, "applications")
     context.update(
