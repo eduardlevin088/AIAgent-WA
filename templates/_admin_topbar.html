@@ -19,7 +19,7 @@
     </nav>
 
     <div class="topbar-actions">
-        <span>{{ admin.username }} · {{ admin.role }}</span>
+        <span>{{ admin.display_name or admin.username }} · {{ admin.role }}</span>
         <form method="post" action="/admin/logout">
             <button class="secondary" type="submit">Выйти</button>
         </form>

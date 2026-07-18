@@ -1,5 +1,3 @@
-import asyncio
-import json
 import os
 import unittest
 from datetime import timedelta
@@ -49,14 +47,6 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
             },
             deal_id=deal_id,
         )
-
-    async def get_request_id(self, deal_id: int = 42) -> int:
-        async with database.db.execute(
-            "SELECT id FROM repair_requests WHERE deal_id = ?",
-            (deal_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
-        return int(row["id"])
 
     def admin_request(self, form: dict[str, str], session_token: str) -> Request:
         body = urlencode(form).encode("utf-8")
@@ -189,110 +179,17 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(forward_result)
         fake_wazzup.send_text.assert_awaited_once()
 
-    async def test_admin_status_change_returns_application_and_skips_duplicates(self):
-        await self.create_request()
-        request_id = await self.get_request_id()
 
-        changed = await database.update_repair_request_status(request_id, "В работе")
-        duplicate = await database.update_repair_request_status(request_id, "В работе")
-        missing = await database.update_repair_request_status(9999, "Готов")
-
-        self.assertTrue(changed["changed"])
-        self.assertEqual(changed["old_status"], "Принят")
-        self.assertEqual(changed["new_status"], "В работе")
-        self.assertEqual(changed["application"]["user_id"], "77000000000")
-        self.assertFalse(duplicate["changed"])
-        self.assertEqual(duplicate["old_status"], "В работе")
-        self.assertIsNone(missing["application"])
-
-    async def test_concurrent_admin_status_change_is_reported_once(self):
-        await self.create_request()
-        request_id = await self.get_request_id()
-
-        results = await asyncio.gather(
-            database.update_repair_request_status(request_id, "В работе"),
-            database.update_repair_request_status(request_id, "В работе"),
-        )
-
-        self.assertEqual(sum(int(result["changed"]) for result in results), 1)
-
-    async def test_admin_status_change_notifies_customer_and_records_audit(self):
-        await self.create_request()
-        request_id = await self.get_request_id()
-        change = await database.update_repair_request_status(request_id, "Готов")
-        fake_wazzup = Mock()
-        fake_wazzup.send_text = AsyncMock(return_value={"messageId": "status-message-1"})
-        original_wazzup = bot.wazzup
-        bot.wazzup = fake_wazzup
-        try:
-            sent = await bot.notify_customer_about_admin_status(
-                change,
-                admin={"id": 7, "username": "operator"},
-            )
-        finally:
-            bot.wazzup = original_wazzup
-
-        self.assertTrue(sent)
-        fake_wazzup.send_text.assert_awaited_once_with(
-            chat_id="77000000000",
-            text="Заявка 10500: готова к выдаче. Менеджер уточнит детали получения.",
-            channel_id="test-channel",
-            chat_type=bot.WAZZUP_CHAT_TYPE,
-        )
-        dialog = await database.get_recent_dialog("77000000000")
-        self.assertEqual(dialog[-1]["message_type"], "status")
-        self.assertEqual(dialog[-1]["text"], fake_wazzup.send_text.await_args.kwargs["text"])
-
-        async with database.db.execute(
-            "SELECT event_type, payload FROM analytics_events ORDER BY id DESC LIMIT 1"
-        ) as cursor:
-            event = await cursor.fetchone()
-        payload = json.loads(event["payload"])
-        self.assertEqual(event["event_type"], "admin_status_changed")
-        self.assertEqual(payload["admin_username"], "operator")
-        self.assertEqual(payload["old_status"], "Принят")
-        self.assertEqual(payload["new_status"], "Готов")
-        self.assertTrue(payload["notification_sent"])
-
-    async def test_admin_status_notification_failure_keeps_change_and_logs_failure(self):
-        await self.create_request()
-        request_id = await self.get_request_id()
-        change = await database.update_repair_request_status(request_id, "Диагностика")
-        fake_wazzup = Mock()
-        fake_wazzup.send_text = AsyncMock(side_effect=RuntimeError("Wazzup unavailable"))
-        original_wazzup = bot.wazzup
-        bot.wazzup = fake_wazzup
-        try:
-            with self.assertLogs("bot", level="ERROR"):
-                sent = await bot.notify_customer_about_admin_status(
-                    change,
-                    admin={"id": 7, "username": "operator"},
-                )
-        finally:
-            bot.wazzup = original_wazzup
-
-        self.assertFalse(sent)
-        async with database.db.execute(
-            "SELECT status FROM repair_requests WHERE id = ?",
-            (request_id,),
-        ) as cursor:
-            request = await cursor.fetchone()
-        self.assertEqual(request["status"], "Диагностика")
-
-        async with database.db.execute(
-            "SELECT payload FROM analytics_events ORDER BY id DESC LIMIT 1"
-        ) as cursor:
-            event = await cursor.fetchone()
-        payload = json.loads(event["payload"])
-        self.assertFalse(payload["notification_sent"])
-        self.assertEqual(payload["notification_error"], "Wazzup unavailable")
-
-    async def test_admin_applications_template_renders_status_controls(self):
+    async def test_applications_are_read_only_and_header_uses_registered_name(self):
         await self.create_request()
         applications = await database.list_repair_requests()
 
         html = bot.templates.env.get_template("admin_applications.html").render(
-            admin={"username": "operator", "role": "operator"},
+            admin={
+                "username": "internal.login",
+                "display_name": "Айжан Садыкова",
+                "role": "operator",
+            },
             admin_sections=bot.ADMIN_SECTIONS,
             active_section="applications",
             applications=applications,
@@ -300,120 +197,13 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
             stats=await database.get_repair_request_stats(),
             statuses=database.REPAIR_REQUEST_STATUSES,
             q="",
-            current_path="/admin/applications",
-            current_query="q=10500",
-            notification_failed=True,
         )
 
-        self.assertIn('action="/admin/applications/1/status"', html)
-        self.assertIn('aria-label="Статус заявки №10500"', html)
-        self.assertIn('<option value="Принят" selected>Принят</option>', html)
-        self.assertIn('value="/admin/applications?q=10500"', html)
-        self.assertIn("WhatsApp-уведомление не доставлено", html)
-
-    async def test_admin_status_route_updates_notifies_and_surfaces_delivery_failure(self):
-        await self.create_request()
-        request_id = await self.get_request_id()
-        await database.upsert_admin_user(
-            "operator",
-            "unused-test-hash",
-            role="operator",
-        )
-        admin = await database.get_admin_user_by_username("operator")
-        session_token = bot.sign_session(int(admin["id"]), bot.ADMIN_SESSION_SECRET)
-        request = self.admin_request(
-            {
-                "status": "Готов",
-                "next": "/admin/applications?q=10500",
-            },
-            session_token,
-        )
-        fake_wazzup = Mock()
-        fake_wazzup.send_text = AsyncMock(return_value={"messageId": "status-message-1"})
-        original_wazzup = bot.wazzup
-        bot.wazzup = fake_wazzup
-        try:
-            response = await bot.admin_application_status(request, request_id)
-
-            fake_wazzup.send_text.side_effect = RuntimeError("Wazzup unavailable")
-            failed_request = self.admin_request(
-                {
-                    "status": "Выдан",
-                    "next": "/admin/applications?q=10500",
-                },
-                session_token,
-            )
-            with self.assertLogs("bot", level="ERROR"):
-                failed_response = await bot.admin_application_status(failed_request, request_id)
-        finally:
-            bot.wazzup = original_wazzup
-
-        self.assertEqual(response.status_code, 303)
-        self.assertEqual(response.headers["location"], "/admin/applications?q=10500")
-        self.assertEqual(failed_response.status_code, 303)
-        self.assertEqual(
-            failed_response.headers["location"],
-            "/admin/applications?q=10500&notification=failed",
-        )
-        async with database.db.execute(
-            "SELECT status FROM repair_requests WHERE id = ?",
-            (request_id,),
-        ) as cursor:
-            application = await cursor.fetchone()
-        self.assertEqual(application["status"], "Выдан")
-        self.assertEqual(fake_wazzup.send_text.await_count, 2)
-
-    async def test_admin_status_route_serializes_notifications_for_same_request(self):
-        await self.create_request()
-        request_id = await self.get_request_id()
-        await database.upsert_admin_user(
-            "operator",
-            "unused-test-hash",
-            role="operator",
-        )
-        admin = await database.get_admin_user_by_username("operator")
-        session_token = bot.sign_session(int(admin["id"]), bot.ADMIN_SESSION_SECRET)
-        first_started = asyncio.Event()
-        second_started = asyncio.Event()
-        release_first = asyncio.Event()
-        sent_statuses: list[str] = []
-
-        async def send_text(*, text: str, **kwargs):
-            if "находится в работе" in text:
-                first_started.set()
-                await release_first.wait()
-                sent_statuses.append("В работе")
-            else:
-                second_started.set()
-                sent_statuses.append("Готов")
-            return {"messageId": f"status-message-{len(sent_statuses)}"}
-
-        fake_wazzup = Mock()
-        fake_wazzup.send_text = AsyncMock(side_effect=send_text)
-        original_wazzup = bot.wazzup
-        bot.wazzup = fake_wazzup
-        first_task = asyncio.create_task(
-            bot.admin_application_status(
-                self.admin_request({"status": "В работе"}, session_token),
-                request_id,
-            )
-        )
-        await first_started.wait()
-        second_task = asyncio.create_task(
-            bot.admin_application_status(
-                self.admin_request({"status": "Готов"}, session_token),
-                request_id,
-            )
-        )
-        try:
-            with self.assertRaises(asyncio.TimeoutError):
-                await asyncio.wait_for(second_started.wait(), timeout=0.05)
-        finally:
-            release_first.set()
-            await asyncio.gather(first_task, second_task)
-            bot.wazzup = original_wazzup
-
-        self.assertEqual(sent_statuses, ["В работе", "Готов"])
+        self.assertIn("Айжан Садыкова · operator", html)
+        self.assertNotIn("internal.login · operator", html)
+        self.assertNotIn("/admin/applications/1/status", html)
+        self.assertNotIn('name="status"', html)
+        self.assertNotIn(">Обновить</button>", html)
 
     async def test_manager_first_response_is_recorded_once(self):
         handoff = await database.create_operator_handoff(

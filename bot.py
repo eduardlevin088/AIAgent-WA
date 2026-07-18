@@ -6,7 +6,6 @@ import json
 import logging
 import re
 import threading
-import weakref
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,7 +36,7 @@ from database import is_bot_paused, list_admin_users, list_customers, list_repai
 from database import log_event, mark_message_processed
 from database import record_operator_message, REPAIR_REQUEST_STATUSES, save_feedback
 from database import save_media_file, set_bot_paused, set_handoff_recipients
-from database import sync_repair_request_status_by_deal_id, update_repair_request_status
+from database import sync_repair_request_status_by_deal_id
 from database import update_admin_user, upsert_admin_user
 from services.agent import generate_response, transcribe
 from services.admin_auth import hash_password, sign_session, verify_password, verify_session
@@ -61,9 +60,6 @@ GENERATION_BUSY_RETRY_DELAY_SECONDS = 0.75
 _user_activity_versions: dict[str, int] = {}
 _user_activity_lock = threading.Lock()
 _user_generation_locks: dict[str, asyncio.Lock] = {}
-_admin_status_change_locks: weakref.WeakValueDictionary[int, asyncio.Lock] = (
-    weakref.WeakValueDictionary()
-)
 CUSTOMER_GREETING_PHRASES = {
     "ассаламу алейкум",
     "ассалаумагалейкум",
@@ -221,14 +217,6 @@ def normalize_admin_next(next_url: str | None) -> str:
     if next_url and next_url.startswith("/admin/"):
         return next_url
     return "/admin/applications"
-
-
-def admin_status_change_lock(request_id: int) -> asyncio.Lock:
-    lock = _admin_status_change_locks.get(request_id)
-    if lock is None:
-        lock = asyncio.Lock()
-        _admin_status_change_locks[request_id] = lock
-    return lock
 
 
 async def current_admin(request: Request) -> dict[str, Any] | None:
@@ -505,62 +493,6 @@ async def notify_customer_about_bitrix_status(
     await append_dialog_message(str(user_id), "assistant", "status", text)
     await log_event(str(user_id), "bitrix_status_notification_sent", str(request_number or ""))
     return True
-
-
-async def notify_customer_about_admin_status(
-    status_change: dict,
-    admin: dict[str, Any],
-) -> bool:
-    application = status_change.get("application")
-    if not application or not status_change.get("changed"):
-        return False
-
-    user_id = str(application.get("user_id") or "").strip()
-    request_number = application.get("request_number")
-    new_status = str(status_change.get("new_status") or "").strip()
-    text = status_notification_text(new_status, str(request_number) if request_number else None)
-    notification_sent = False
-    notification_error: str | None = None
-
-    if user_id:
-        try:
-            await wazzup.send_text(
-                chat_id=user_id,
-                text=text,
-                channel_id=WAZZUP_CHANNEL_ID,
-                chat_type=WAZZUP_CHAT_TYPE,
-            )
-        except Exception as error:
-            notification_error = str(error)[:400]
-            logger.exception(
-                "Failed to send admin status notification for request %s to %s",
-                request_number,
-                user_id,
-            )
-        else:
-            notification_sent = True
-            await append_dialog_message(user_id, "assistant", "status", text)
-    else:
-        notification_error = "WhatsApp chat id is missing"
-
-    await log_event(
-        user_id or None,
-        "admin_status_changed",
-        json.dumps(
-            {
-                "admin_id": admin.get("id"),
-                "admin_username": admin.get("username"),
-                "request_id": application.get("id"),
-                "request_number": request_number,
-                "old_status": status_change.get("old_status"),
-                "new_status": new_status,
-                "notification_sent": notification_sent,
-                "notification_error": notification_error,
-            },
-            ensure_ascii=False,
-        ),
-    )
-    return notification_sent
 
 
 async def record_user_activity(user_id: str) -> int:
@@ -1524,38 +1456,12 @@ async def admin_applications(request: Request):
             "stats": stats,
             "statuses": REPAIR_REQUEST_STATUSES,
             "q": q,
-            "current_path": str(request.url.path),
-            "current_query": str(request.url.query),
-            "notification_failed": request.query_params.get("notification") == "failed",
         }
     )
     return templates.TemplateResponse(
         "admin_applications.html",
         context,
     )
-
-
-@app.post("/admin/applications/{request_id}/status")
-async def admin_application_status(request: Request, request_id: int) -> RedirectResponse:
-    admin = await current_admin(request)
-    if not admin:
-        return RedirectResponse("/admin/login", status_code=303)
-
-    form = await parse_urlencoded_form(request)
-    status = (form.get("status") or "").strip()
-    if status not in REPAIR_REQUEST_STATUSES:
-        raise HTTPException(status_code=400, detail="Invalid repair request status")
-
-    next_url = normalize_admin_next(form.get("next"))
-    async with admin_status_change_lock(request_id):
-        status_change = await update_repair_request_status(request_id, status)
-        if not status_change.get("application"):
-            raise HTTPException(status_code=404, detail="Repair request not found")
-        notification_sent = await notify_customer_about_admin_status(status_change, admin)
-    if status_change.get("changed") and not notification_sent:
-        separator = "&" if "?" in next_url else "?"
-        next_url = f"{next_url}{separator}notification=failed"
-    return RedirectResponse(next_url, status_code=303)
 
 
 @app.get("/admin/templates", response_class=HTMLResponse)

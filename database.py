@@ -1349,52 +1349,6 @@ async def get_repair_request_stats() -> dict[str, int]:
     return stats
 
 
-async def update_repair_request_status(request_id: int, status: str) -> dict:
-    if db is None:
-        raise RuntimeError("Database not initialized")
-
-    while True:
-        async with db.execute("""
-            SELECT id, request_number, user_id, status
-            FROM repair_requests
-            WHERE id = ?
-        """, (request_id,)) as cursor:
-            row = await cursor.fetchone()
-
-        if not row:
-            return {
-                "application": None,
-                "changed": False,
-                "old_status": None,
-                "new_status": status,
-            }
-
-        application = dict(row)
-        old_status = application.get("status")
-        if old_status == status:
-            return {
-                "application": application,
-                "changed": False,
-                "old_status": old_status,
-                "new_status": status,
-            }
-
-        cursor = await db.execute("""
-            UPDATE repair_requests
-            SET status = ?, updated_at = CURRENT_TIMESTAMP
-            WHERE id = ? AND status IS ?
-        """, (status, request_id, old_status))
-        await db.commit()
-        if cursor.rowcount:
-            application["status"] = status
-            return {
-                "application": application,
-                "changed": True,
-                "old_status": old_status,
-                "new_status": status,
-            }
-
-
 async def update_repair_request_status_by_deal_id(deal_id: int, status: str) -> int:
     if db is None:
         raise RuntimeError("Database not initialized")
