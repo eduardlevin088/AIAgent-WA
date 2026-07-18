@@ -587,6 +587,31 @@ async def get_admin_user_by_id(admin_id: int) -> dict | None:
     return user
 
 
+async def count_active_superadmins() -> int:
+    if db is None:
+        raise RuntimeError("Database not initialized")
+
+    async with db.execute("""
+        SELECT COUNT(*) AS count
+        FROM admin_users
+        WHERE role = 'superadmin' AND is_active = 1
+    """) as cursor:
+        row = await cursor.fetchone()
+    return int(row["count"])
+
+
+async def delete_admin_user_by_id(admin_id: int) -> bool:
+    if db is None:
+        raise RuntimeError("Database not initialized")
+
+    cursor = await db.execute(
+        "DELETE FROM admin_users WHERE id = ?",
+        (admin_id,),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
 async def save_file_id(user_id: str, file_id: str):
     await save_media_file(user_id=user_id, file_id=file_id)
 

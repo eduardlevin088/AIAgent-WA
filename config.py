@@ -115,5 +115,3 @@ WAZZUP_CHAT_TYPE = os.getenv("WAZZUP_CHAT_TYPE", "whatsapp")
 WAZZUP_CHAT_LINK_BASE = (os.getenv("WAZZUP_CHAT_LINK_BASE") or "").rstrip("/")
 INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY")
 ADMIN_SESSION_SECRET = os.getenv("ADMIN_SESSION_SECRET") or INTERNAL_API_KEY or GPT_KEY or "dev-admin-session-secret"
-ADMIN_USERNAME = (os.getenv("ADMIN_USERNAME") or "").strip()
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD") or ""

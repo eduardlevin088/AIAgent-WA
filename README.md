@@ -42,6 +42,7 @@ Optional:
 DATA_DIR=./data
 MEDIA_DIR=./data/media
 INTERNAL_API_KEY=secret-for-/send-endpoint
+ADMIN_SESSION_SECRET=replace-with-a-long-random-secret
 ADMIN_IDS=77000000000,77111111111
 ENABLE_CHAT_ALLOWLIST=1
 ALLOWED_CHAT_IDS=77000000000,77111111111
@@ -51,6 +52,8 @@ BITRIX_STAGE_STATUS_MAP={"C5:UC_SRW3R8":"Принят","C5:EXECUTING":"В раб
 ```
 
 `ADMIN_IDS` is only an optional startup seed. Runtime admins are stored in the SQLite `admin` table and can be changed with `/newadmin` and `/deladmin`.
+
+Admin-panel authentication uses only login/password accounts stored in the SQLite `admin_users` table. There are no environment-based bootstrap credentials; superadmins manage these accounts in `/admin/users`.
 
 `ENABLE_CHAT_ALLOWLIST=1` makes the bot process inbound Wazzup messages only from `ALLOWED_CHAT_IDS`. Leave it unset/false for production traffic from all customers.
 

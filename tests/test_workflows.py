@@ -528,12 +528,15 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
                     operator_session,
                 )
             )
+        with self.assertRaises(bot.HTTPException) as delete_error:
+            await bot.admin_user_delete(request, recipient_id)
 
         self.assertEqual(settings_response.status_code, 200)
         self.assertEqual(settings_save_response.status_code, 303)
         self.assertEqual(await database.get_handoff_recipient_ids(), ["77000000003"])
         self.assertEqual(users_error.exception.status_code, 403)
         self.assertEqual(create_error.exception.status_code, 403)
+        self.assertEqual(delete_error.exception.status_code, 403)
         self.assertEqual(owner["role"], "superadmin")
 
     async def test_superadmin_creates_user_with_required_name_role_and_phone(self):
@@ -583,6 +586,66 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(
             await database.get_admin_user_by_username(valid_form["username"])
         )
+
+    async def test_superadmin_can_delete_another_user_but_not_self(self):
+        await database.upsert_admin_user("owner", "owner-hash", role="superadmin")
+        owner = await database.get_admin_user_by_username("owner")
+        operator_id = await database.create_admin_user(
+            username="operator.to.delete",
+            password_hash="operator-hash",
+            display_name="Удаляемый оператор",
+            role="operator",
+            whatsapp_id="77000000006",
+        )
+        owner_session = bot.sign_session(int(owner["id"]), bot.ADMIN_SESSION_SECRET)
+
+        self_delete_response = await bot.admin_user_delete(
+            self.admin_request({}, owner_session),
+            int(owner["id"]),
+        )
+        delete_response = await bot.admin_user_delete(
+            self.admin_request({}, owner_session),
+            operator_id,
+        )
+
+        self.assertEqual(self_delete_response.status_code, 400)
+        self.assertIsNotNone(await database.get_admin_user_by_id(int(owner["id"])))
+        self.assertEqual(delete_response.status_code, 303)
+        self.assertIsNone(await database.get_admin_user_by_id(operator_id))
+
+    async def test_user_list_shows_delete_button_only_for_other_users(self):
+        html = bot.templates.env.get_template("admin_users.html").render(
+            admin={"id": 1, "username": "owner", "role": "superadmin"},
+            admin_sections=bot.ADMIN_SECTIONS,
+            active_section="users",
+            users=[
+                {
+                    "id": 1,
+                    "username": "owner",
+                    "display_name": "Владелец",
+                    "role": "superadmin",
+                    "is_active": True,
+                    "whatsapp_id": "77000000001",
+                    "receives_handoffs": False,
+                },
+                {
+                    "id": 2,
+                    "username": "operator",
+                    "display_name": "Оператор",
+                    "role": "operator",
+                    "is_active": True,
+                    "whatsapp_id": "77000000002",
+                    "receives_handoffs": False,
+                },
+            ],
+            saved=False,
+            deleted=False,
+            error=None,
+        )
+
+        self.assertNotIn('/admin/users/1/delete', html)
+        self.assertIn('/admin/users/2/delete', html)
+        self.assertEqual(html.count('>Удалить</button>'), 1)
 
     async def test_handoff_settings_show_only_recipient_names(self):
         html = bot.templates.env.get_template("admin_settings.html").render(

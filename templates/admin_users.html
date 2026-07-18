@@ -94,6 +94,11 @@
         margin: 0;
     }
 
+    .user-actions {
+        display: grid;
+        gap: 8px;
+    }
+
     .empty {
         padding: 30px;
         text-align: center;
@@ -130,11 +135,12 @@
         <section class="page-heading" aria-labelledby="users-title">
             <div>
                 <h1 id="users-title">Пользователи</h1>
-                <p>Учётные записи сотрудников. Только superadmin может создавать и изменять пользователей.</p>
+                <p>Учётные записи сотрудников. Только superadmin может создавать, изменять и удалять пользователей.</p>
             </div>
         </section>
 
         {% if saved %}<div class="notice" role="status">Изменения сохранены.</div>{% endif %}
+        {% if deleted %}<div class="notice" role="status">Пользователь удалён.</div>{% endif %}
         {% if error %}<div class="error" role="alert">{{ error }}</div>{% endif %}
 
         <section class="panel create-panel" aria-labelledby="create-user-title">
@@ -194,12 +200,22 @@
                             <label>Номер WhatsApp
                                 <input name="whatsapp_id" inputmode="tel" autocomplete="tel" required value="{{ user.whatsapp_id or '' }}" placeholder="77001234567">
                             </label>
-                            <div>
+                            <div class="user-actions">
                                 <label class="checkbox-label">
                                     <input type="checkbox" name="is_active" value="1" {% if user.is_active %}checked{% endif %}>
                                     Активен
                                 </label>
                                 <button type="submit">Сохранить</button>
+                                {% if user.id != admin.id %}
+                                    <button
+                                        class="danger"
+                                        type="submit"
+                                        formaction="/admin/users/{{ user.id }}/delete"
+                                        formmethod="post"
+                                        formnovalidate
+                                        onclick="return confirm('Удалить этого пользователя?')"
+                                    >Удалить</button>
+                                {% endif %}
                             </div>
                         </form>
                     </article>

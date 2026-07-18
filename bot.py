@@ -17,9 +17,9 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
-from config import ABSOLUTE_LIMIT, ADMIN_IDS, ADMIN_PASSWORD, ADMIN_SESSION_SECRET
+from config import ABSOLUTE_LIMIT, ADMIN_IDS, ADMIN_SESSION_SECRET
 from config import ALLOWED_CHAT_IDS, ENABLE_CHAT_ALLOWLIST
-from config import ADMIN_USERNAME, BITRIX_APPLICATION_TOKEN, BITRIX_STAGE_STATUS_MAP
+from config import BITRIX_APPLICATION_TOKEN, BITRIX_STAGE_STATUS_MAP
 from config import GPT_MODEL, GREETING_TEXT_PATH, INTERNAL_API_KEY, LIMIT_PER_USER
 from config import MANAGER_HANDOFF_POLL_SECONDS, MANAGER_HANDOFF_TIMEOUT_MINUTES
 from config import SUPERADMIN_ID, WAZZUP_CHANNEL_ID, WAZZUP_CHAT_LINK_BASE, WAZZUP_CHAT_TYPE
@@ -27,7 +27,8 @@ from database import add_token_usage, append_dialog_message, cancel_open_operato
 from database import close_db, close_expired_operator_handoffs, count_media_files
 from database import create_admin, create_operator_handoff
 from database import create_or_update_user, delete_admin, execute_query, get_admin_ids
-from database import create_admin_user, get_admin_user_by_id, get_admin_user_by_username
+from database import count_active_superadmins, create_admin_user, delete_admin_user_by_id
+from database import get_admin_user_by_id, get_admin_user_by_username
 from database import get_analytics_summary, get_handoff_recipient_ids
 from database import get_notification_template_text, get_repair_request_group_stats
 from database import get_media_files, get_operator_handoff_stats, get_recent_dialog
@@ -39,7 +40,7 @@ from database import log_event, mark_message_processed
 from database import record_operator_message, REPAIR_REQUEST_STATUSES, save_feedback
 from database import save_media_file, set_bot_paused, set_handoff_recipients
 from database import sync_repair_request_status_by_deal_id
-from database import update_admin_user, upsert_admin_user
+from database import update_admin_user
 from database import update_notification_templates
 from services.agent import generate_response, transcribe
 from services.admin_auth import hash_password, sign_session, verify_password, verify_session
@@ -140,8 +141,6 @@ async def lifespan(app: FastAPI):
     logger.info("Starting WhatsApp webhook service...")
     await init_db()
     await wazzup.start()
-    if ADMIN_USERNAME and ADMIN_PASSWORD:
-        await upsert_admin_user(ADMIN_USERNAME, hash_password(ADMIN_PASSWORD), role="superadmin")
     for admin_id in ADMIN_IDS:
         await create_admin(admin_id)
     handoff_timeout_task = asyncio.create_task(manager_handoff_timeout_worker())
@@ -1730,6 +1729,7 @@ async def render_admin_users(
         "users": await list_admin_users(),
         "error": error,
         "saved": request.query_params.get("saved") == "1",
+        "deleted": request.query_params.get("deleted") == "1",
     })
     return templates.TemplateResponse("admin_users.html", context, status_code=status_code)
 
@@ -1769,6 +1769,41 @@ async def admin_user_create(request: Request):
     except ValueError as exc:
         return await render_admin_users(request, admin, str(exc), 400)
     return RedirectResponse("/admin/users?saved=1", status_code=303)
+
+
+@app.post("/admin/users/{admin_id}/delete", response_class=HTMLResponse)
+async def admin_user_delete(request: Request, admin_id: int):
+    admin = await current_admin(request)
+    if not admin:
+        return RedirectResponse("/admin/login", status_code=303)
+    if admin.get("role") != "superadmin":
+        raise HTTPException(status_code=403, detail="Only superadmins can manage users")
+
+    target = await get_admin_user_by_id(admin_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="Admin user not found")
+    if int(admin["id"]) == admin_id:
+        return await render_admin_users(
+            request,
+            admin,
+            "Нельзя удалить собственную учётную запись",
+            400,
+        )
+    if (
+        target.get("role") == "superadmin"
+        and int(target.get("is_active") or 0)
+        and await count_active_superadmins() <= 1
+    ):
+        return await render_admin_users(
+            request,
+            admin,
+            "Нельзя удалить последнего активного superadmin",
+            400,
+        )
+
+    if not await delete_admin_user_by_id(admin_id):
+        raise HTTPException(status_code=404, detail="Admin user not found")
+    return RedirectResponse("/admin/users?deleted=1", status_code=303)
 
 
 @app.post("/admin/users/{admin_id}/update", response_class=HTMLResponse)
