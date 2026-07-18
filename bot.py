@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import threading
+import weakref
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,15 +28,17 @@ from database import add_token_usage, append_dialog_message, cancel_open_operato
 from database import close_db, close_expired_operator_handoffs, count_media_files
 from database import create_admin, create_operator_handoff
 from database import create_or_update_user, delete_admin, execute_query, get_admin_ids
-from database import get_admin_user_by_id, get_admin_user_by_username, get_analytics_summary
+from database import create_admin_user, get_admin_user_by_id, get_admin_user_by_username
+from database import get_analytics_summary, get_handoff_recipient_ids
 from database import get_media_files, get_operator_handoff_stats, get_recent_dialog
 from database import get_repair_request_stats
 from database import get_token_usage, get_user_conversation, get_users, init_db
-from database import is_bot_paused, list_customers, list_repair_requests, log_event, mark_message_processed
+from database import is_bot_paused, list_admin_users, list_customers, list_repair_requests
+from database import log_event, mark_message_processed
 from database import record_operator_message, REPAIR_REQUEST_STATUSES, save_feedback
-from database import save_media_file, set_bot_paused
+from database import save_media_file, set_bot_paused, set_handoff_recipients
 from database import sync_repair_request_status_by_deal_id, update_repair_request_status
-from database import upsert_admin_user
+from database import update_admin_user, upsert_admin_user
 from services.agent import generate_response, transcribe
 from services.admin_auth import hash_password, sign_session, verify_password, verify_session
 from services.integrations import get_bitrix_deal_stage_id, upload_files_to_bitrix
@@ -58,6 +61,9 @@ GENERATION_BUSY_RETRY_DELAY_SECONDS = 0.75
 _user_activity_versions: dict[str, int] = {}
 _user_activity_lock = threading.Lock()
 _user_generation_locks: dict[str, asyncio.Lock] = {}
+_admin_status_change_locks: weakref.WeakValueDictionary[int, asyncio.Lock] = (
+    weakref.WeakValueDictionary()
+)
 CUSTOMER_GREETING_PHRASES = {
     "ассаламу алейкум",
     "ассалаумагалейкум",
@@ -159,8 +165,8 @@ ADMIN_SECTIONS = [
     {"id": "statistics", "label": "Статистика", "href": "/admin/statistics"},
     {"id": "customers", "label": "Клиенты", "href": "/admin/customers"},
     {"id": "payments", "label": "Платежи", "href": "/admin/payments", "status": "В разработке"},
-    {"id": "settings", "label": "Настройки", "href": "/admin/settings", "status": "В разработке"},
-    {"id": "users", "label": "Пользователи", "href": "/admin/users", "status": "В разработке"},
+    {"id": "settings", "label": "Настройки", "href": "/admin/settings"},
+    {"id": "users", "label": "Пользователи", "href": "/admin/users"},
 ]
 BITRIX_NOTIFICATION_TEMPLATE_STAGES = [
     {"stage_id": "C5:PREPARATION", "stage_name": "Передан в сервисный центр"},
@@ -217,6 +223,14 @@ def normalize_admin_next(next_url: str | None) -> str:
     return "/admin/applications"
 
 
+def admin_status_change_lock(request_id: int) -> asyncio.Lock:
+    lock = _admin_status_change_locks.get(request_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _admin_status_change_locks[request_id] = lock
+    return lock
+
+
 async def current_admin(request: Request) -> dict[str, Any] | None:
     session = request.cookies.get(ADMIN_COOKIE_NAME)
     payload = verify_session(session, ADMIN_SESSION_SECRET)
@@ -235,12 +249,24 @@ async def current_admin(request: Request) -> dict[str, Any] | None:
 
 
 def admin_template_context(request: Request, admin: dict[str, Any], active_section: str) -> dict[str, Any]:
+    sections = ADMIN_SECTIONS
+    if admin.get("role") != "superadmin":
+        sections = [section for section in sections if section["id"] != "users"]
     return {
         "request": request,
         "admin": admin,
-        "admin_sections": ADMIN_SECTIONS,
+        "admin_sections": sections,
         "active_section": active_section,
     }
+
+
+def normalize_whatsapp_id(value: str | None) -> str | None:
+    cleaned = re.sub(r"[\s()+-]", "", value or "")
+    if not cleaned:
+        return None
+    if not cleaned.isdigit() or not 7 <= len(cleaned) <= 20:
+        raise ValueError("WhatsApp ID должен содержать от 7 до 20 цифр")
+    return cleaned
 
 
 def admin_login_redirect(request: Request) -> RedirectResponse:
@@ -479,6 +505,62 @@ async def notify_customer_about_bitrix_status(
     await append_dialog_message(str(user_id), "assistant", "status", text)
     await log_event(str(user_id), "bitrix_status_notification_sent", str(request_number or ""))
     return True
+
+
+async def notify_customer_about_admin_status(
+    status_change: dict,
+    admin: dict[str, Any],
+) -> bool:
+    application = status_change.get("application")
+    if not application or not status_change.get("changed"):
+        return False
+
+    user_id = str(application.get("user_id") or "").strip()
+    request_number = application.get("request_number")
+    new_status = str(status_change.get("new_status") or "").strip()
+    text = status_notification_text(new_status, str(request_number) if request_number else None)
+    notification_sent = False
+    notification_error: str | None = None
+
+    if user_id:
+        try:
+            await wazzup.send_text(
+                chat_id=user_id,
+                text=text,
+                channel_id=WAZZUP_CHANNEL_ID,
+                chat_type=WAZZUP_CHAT_TYPE,
+            )
+        except Exception as error:
+            notification_error = str(error)[:400]
+            logger.exception(
+                "Failed to send admin status notification for request %s to %s",
+                request_number,
+                user_id,
+            )
+        else:
+            notification_sent = True
+            await append_dialog_message(user_id, "assistant", "status", text)
+    else:
+        notification_error = "WhatsApp chat id is missing"
+
+    await log_event(
+        user_id or None,
+        "admin_status_changed",
+        json.dumps(
+            {
+                "admin_id": admin.get("id"),
+                "admin_username": admin.get("username"),
+                "request_id": application.get("id"),
+                "request_number": request_number,
+                "old_status": status_change.get("old_status"),
+                "new_status": new_status,
+                "notification_sent": notification_sent,
+                "notification_error": notification_error,
+            },
+            ensure_ascii=False,
+        ),
+    )
+    return notification_sent
 
 
 async def record_user_activity(user_id: str) -> int:
@@ -804,6 +886,27 @@ async def notify_admins(
             logger.exception("Failed to notify admin %s", admin_id)
 
 
+async def notify_handoff_recipients(
+    text: str,
+    channel_id: str,
+    chat_type: str,
+) -> None:
+    recipient_ids = await get_handoff_recipient_ids()
+    if not recipient_ids:
+        recipient_ids = await get_admin_ids()
+
+    for recipient_id in dict.fromkeys(recipient_ids):
+        try:
+            await wazzup.send_text(
+                chat_id=str(recipient_id),
+                text=text,
+                channel_id=channel_id,
+                chat_type=chat_type,
+            )
+        except Exception:
+            logger.exception("Failed to send handoff to admin user %s", recipient_id)
+
+
 def format_recent_dialog(dialog: list[dict[str, Any]]) -> str:
     lines = []
     for item in dialog:
@@ -846,7 +949,7 @@ async def handle_handoff(
         "Последние сообщения:\n"
         f"{format_recent_dialog(dialog)}"
     )
-    await notify_admins(admin_text, channel_id, chat_type)
+    await notify_handoff_recipients(admin_text, channel_id, chat_type)
 
 
 async def maybe_save_feedback(user: ChatUser, text: str, channel_id: str, chat_type: str) -> bool:
@@ -1423,6 +1526,7 @@ async def admin_applications(request: Request):
             "q": q,
             "current_path": str(request.url.path),
             "current_query": str(request.url.query),
+            "notification_failed": request.query_params.get("notification") == "failed",
         }
     )
     return templates.TemplateResponse(
@@ -1442,8 +1546,15 @@ async def admin_application_status(request: Request, request_id: int) -> Redirec
     if status not in REPAIR_REQUEST_STATUSES:
         raise HTTPException(status_code=400, detail="Invalid repair request status")
 
-    await update_repair_request_status(request_id, status)
     next_url = normalize_admin_next(form.get("next"))
+    async with admin_status_change_lock(request_id):
+        status_change = await update_repair_request_status(request_id, status)
+        if not status_change.get("application"):
+            raise HTTPException(status_code=404, detail="Repair request not found")
+        notification_sent = await notify_customer_about_admin_status(status_change, admin)
+    if status_change.get("changed") and not notification_sent:
+        separator = "&" if "?" in next_url else "?"
+        next_url = f"{next_url}{separator}notification=failed"
     return RedirectResponse(next_url, status_code=303)
 
 
@@ -1586,24 +1697,159 @@ async def admin_payments(request: Request):
 
 @app.get("/admin/settings", response_class=HTMLResponse)
 async def admin_settings(request: Request):
-    return await render_admin_placeholder(
-        request,
-        "settings",
-        "Настройки",
-        "Рабочие параметры бота и интеграций без хранения секретов в браузере.",
-        ["рабочие часы", "режим тестовых номеров", "проверка Wazzup, Bitrix и Kaspi"],
-    )
+    admin = await current_admin(request)
+    if not admin:
+        return admin_login_redirect(request)
+
+    users = [
+        user
+        for user in await list_admin_users()
+        if user["is_active"] and user.get("whatsapp_id")
+    ]
+    context = admin_template_context(request, admin, "settings")
+    context.update({
+        "users": users,
+        "saved": request.query_params.get("saved") == "1",
+    })
+    return templates.TemplateResponse("admin_settings.html", context)
+
+
+@app.post("/admin/settings/handoff-recipients")
+async def admin_settings_handoff_recipients(request: Request) -> RedirectResponse:
+    admin = await current_admin(request)
+    if not admin:
+        return RedirectResponse("/admin/login", status_code=303)
+
+    form = await parse_urlencoded_form(request)
+    recipient_value = (form.get("recipient_id") or "").strip()
+    try:
+        selected_id = int(recipient_value) if recipient_value else None
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid handoff recipient") from exc
+
+    users = await list_admin_users()
+    eligible_ids = {
+        int(user["id"])
+        for user in users
+        if user["is_active"] and user.get("whatsapp_id")
+    }
+    if selected_id is not None and selected_id not in eligible_ids:
+        raise HTTPException(status_code=400, detail="Handoff recipient must be active and have WhatsApp ID")
+
+    await set_handoff_recipients([selected_id] if selected_id is not None else [])
+    return RedirectResponse("/admin/settings?saved=1", status_code=303)
 
 
 @app.get("/admin/users", response_class=HTMLResponse)
 async def admin_users_page(request: Request):
-    return await render_admin_placeholder(
-        request,
-        "users",
-        "Пользователи",
-        "Операторы, администраторы и роли доступа.",
-        ["создание операторов", "активация и блокировка", "роли и права"],
-    )
+    admin = await current_admin(request)
+    if not admin:
+        return admin_login_redirect(request)
+    if admin.get("role") != "superadmin":
+        raise HTTPException(status_code=403, detail="Only superadmins can manage users")
+    return await render_admin_users(request, admin)
+
+
+async def render_admin_users(
+    request: Request,
+    admin: dict[str, Any],
+    error: str | None = None,
+    status_code: int = 200,
+):
+    context = admin_template_context(request, admin, "users")
+    context.update({
+        "users": await list_admin_users(),
+        "error": error,
+        "saved": request.query_params.get("saved") == "1",
+    })
+    return templates.TemplateResponse("admin_users.html", context, status_code=status_code)
+
+
+@app.post("/admin/users/create", response_class=HTMLResponse)
+async def admin_user_create(request: Request):
+    admin = await current_admin(request)
+    if not admin:
+        return RedirectResponse("/admin/login", status_code=303)
+    if admin.get("role") != "superadmin":
+        raise HTTPException(status_code=403, detail="Only superadmins can manage users")
+
+    form = await parse_urlencoded_form(request)
+    display_name = (form.get("display_name") or "").strip()
+    username = (form.get("username") or "").strip()
+    password = form.get("password") or ""
+    role = (form.get("role") or "").strip()
+    if len(username) < 3 or len(username) > 64 or any(char.isspace() for char in username):
+        return await render_admin_users(request, admin, "Логин: 3–64 символа без пробелов", 400)
+    if len(display_name) < 2 or len(display_name) > 100:
+        return await render_admin_users(request, admin, "Имя: от 2 до 100 символов", 400)
+    if len(password) < 8:
+        return await render_admin_users(request, admin, "Пароль должен содержать минимум 8 символов", 400)
+    if role not in {"operator", "superadmin"}:
+        return await render_admin_users(request, admin, "Выберите роль", 400)
+    try:
+        whatsapp_id = normalize_whatsapp_id(form.get("whatsapp_id"))
+        if not whatsapp_id:
+            raise ValueError("Укажите номер WhatsApp")
+        await create_admin_user(
+            username,
+            hash_password(password),
+            display_name,
+            role,
+            whatsapp_id,
+        )
+    except ValueError as exc:
+        return await render_admin_users(request, admin, str(exc), 400)
+    return RedirectResponse("/admin/users?saved=1", status_code=303)
+
+
+@app.post("/admin/users/{admin_id}/update", response_class=HTMLResponse)
+async def admin_user_update(request: Request, admin_id: int):
+    admin = await current_admin(request)
+    if not admin:
+        return RedirectResponse("/admin/login", status_code=303)
+    if admin.get("role") != "superadmin":
+        raise HTTPException(status_code=403, detail="Only superadmins can manage users")
+
+    target = await get_admin_user_by_id(admin_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="Admin user not found")
+    form = await parse_urlencoded_form(request)
+    display_name = (form.get("display_name") or "").strip()
+    username = (form.get("username") or "").strip()
+    password = form.get("password") or ""
+    role = (form.get("role") or "").strip()
+    is_active = form.get("is_active") == "1"
+    if int(admin["id"]) == admin_id and (not is_active or role != "superadmin"):
+        return await render_admin_users(
+            request,
+            admin,
+            "Нельзя отключить собственную учётную запись или снять с неё роль superadmin",
+            400,
+        )
+    if len(username) < 3 or len(username) > 64 or any(char.isspace() for char in username):
+        return await render_admin_users(request, admin, "Логин: 3–64 символа без пробелов", 400)
+    if len(display_name) < 2 or len(display_name) > 100:
+        return await render_admin_users(request, admin, "Имя: от 2 до 100 символов", 400)
+    if password and len(password) < 8:
+        return await render_admin_users(request, admin, "Новый пароль должен содержать минимум 8 символов", 400)
+    if role not in {"operator", "superadmin"}:
+        return await render_admin_users(request, admin, "Выберите роль", 400)
+    try:
+        whatsapp_id = normalize_whatsapp_id(form.get("whatsapp_id"))
+        if not whatsapp_id:
+            raise ValueError("Укажите номер WhatsApp")
+        await update_admin_user(
+            admin_id,
+            username=username,
+            display_name=display_name,
+            role=role,
+            whatsapp_id=whatsapp_id,
+            is_active=is_active,
+            password_hash=hash_password(password) if password else None,
+        )
+    except ValueError as exc:
+        return await render_admin_users(request, admin, str(exc), 400)
+    return RedirectResponse("/admin/users?saved=1", status_code=303)
 
 
 @app.get("/health")

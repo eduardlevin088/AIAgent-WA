@@ -1,0 +1,92 @@
+{% extends "admin_base.html" %}
+
+{% block title %}Настройки{% endblock %}
+
+{% block head %}
+<style>
+    .notice {
+        margin-bottom: 16px;
+        padding: 12px 14px;
+        color: var(--accent);
+        background: rgba(15, 111, 104, 0.08);
+        border: 1px solid rgba(15, 111, 104, 0.2);
+        border-radius: var(--radius);
+    }
+
+    .settings-panel {
+        max-width: 860px;
+        padding: 20px;
+    }
+
+    fieldset {
+        min-width: 0;
+        padding: 0;
+        border: 0;
+    }
+
+    legend {
+        padding: 0;
+        font-size: 20px;
+        font-weight: 760;
+    }
+
+    .field-help {
+        margin: 7px 0 16px;
+        color: var(--muted);
+        line-height: 1.45;
+    }
+
+    .recipient-field {
+        display: grid;
+        gap: 7px;
+        max-width: 440px;
+        margin-bottom: 18px;
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 700;
+    }
+
+    .empty-note {
+        margin-bottom: 18px;
+    }
+</style>
+{% endblock %}
+
+{% block body %}
+<div class="shell">
+    {% include "_admin_topbar.html" %}
+
+    <main class="page">
+        <section class="page-heading" aria-labelledby="settings-title">
+            <div>
+                <h1 id="settings-title">Настройки</h1>
+                <p>Рабочие параметры бота и маршрутизация обращений к операторам.</p>
+            </div>
+        </section>
+
+        {% if saved %}<div class="notice" role="status">Получатель сохранён.</div>{% endif %}
+
+        <form class="panel settings-panel" method="post" action="/admin/settings/handoff-recipients">
+            <fieldset>
+                <legend>Передача диалога оператору</legend>
+                <p class="field-help">Выберите одного сотрудника, которому бот отправит историю диалога при передаче обращения человеку.</p>
+
+                {% if users %}
+                    <label class="recipient-field">Получатель
+                        <select name="recipient_id">
+                            <option value="">Не назначен</option>
+                            {% for user in users %}
+                                <option value="{{ user.id }}" {% if user.receives_handoffs %}selected{% endif %}>{{ user.display_name }}</option>
+                            {% endfor %}
+                        </select>
+                    </label>
+                {% else %}
+                    <p class="muted empty-note">Нет активных пользователей с номером WhatsApp. Обратитесь к superadmin.</p>
+                {% endif %}
+            </fieldset>
+
+            <button type="submit" {% if not users %}disabled{% endif %}>Сохранить получателя</button>
+        </form>
+    </main>
+</div>
+{% endblock %}

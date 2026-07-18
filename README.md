@@ -132,6 +132,7 @@ The built-in statuses are: `Принят`, `Диагностика`, `В раб�
 - A greeting-only customer message starts a fresh dialogue and sends the fixed text from `static/greeting.txt` without involving the LLM. Slash commands remain supported for compatibility.
 - `/operator` pauses the bot for that client and sends recent dialog history to admins.
 - `/resume` or `/start` re-enables the bot.
+- Operators can change a repair status from the application card. A changed status is sent to the customer in WhatsApp and recorded with the operator identity; delivery failures remain in the audit log and are shown in the admin panel for manual follow-up.
 - Feedback can be sent as `/feedback 5 text` or `оценка 5 text`.
 - Superadmin command `/analytics` returns basic counters.
 

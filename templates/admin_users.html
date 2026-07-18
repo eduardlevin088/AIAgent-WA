@@ -1,0 +1,213 @@
+{% extends "admin_base.html" %}
+
+{% block title %}Пользователи{% endblock %}
+
+{% block head %}
+<style>
+    .notice {
+        margin-bottom: 16px;
+        padding: 12px 14px;
+        color: var(--accent);
+        background: rgba(15, 111, 104, 0.08);
+        border: 1px solid rgba(15, 111, 104, 0.2);
+        border-radius: var(--radius);
+    }
+
+    .create-panel {
+        padding: 18px;
+        margin-bottom: 18px;
+    }
+
+    .create-panel h2,
+    .user-card h2 {
+        margin: 0;
+        font-size: 18px;
+    }
+
+    .form-grid {
+        display: grid;
+        grid-template-columns: minmax(150px, 1.1fr) minmax(150px, 1fr) minmax(170px, 1fr) minmax(140px, .8fr) minmax(180px, 1fr) auto;
+        gap: 12px;
+        align-items: end;
+        margin-top: 14px;
+    }
+
+    label {
+        display: grid;
+        gap: 6px;
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 700;
+    }
+
+    .users-list {
+        display: grid;
+        gap: 12px;
+    }
+
+    .user-card {
+        padding: 17px;
+    }
+
+    .user-card__heading {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 14px;
+    }
+
+    .badges {
+        display: flex;
+        gap: 7px;
+        flex-wrap: wrap;
+    }
+
+    .badge {
+        display: inline-flex;
+        align-items: center;
+        min-height: 25px;
+        padding: 0 9px;
+        color: var(--muted);
+        background: #eeeae0;
+        border-radius: 999px;
+        font-size: 12px;
+        font-weight: 700;
+    }
+
+    .badge.accent {
+        color: var(--accent);
+        background: rgba(15, 111, 104, .1);
+    }
+
+    .checkbox-label {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        min-height: 36px;
+        color: var(--ink);
+        font-size: 14px;
+    }
+
+    .checkbox-label input {
+        width: 18px;
+        min-height: 18px;
+        margin: 0;
+    }
+
+    .empty {
+        padding: 30px;
+        text-align: center;
+    }
+
+    @media (max-width: 1050px) {
+        .form-grid {
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+    }
+
+    @media (max-width: 620px) {
+        .form-grid {
+            grid-template-columns: 1fr;
+        }
+
+        .form-grid button {
+            width: 100%;
+        }
+
+        .user-card__heading {
+            align-items: flex-start;
+            flex-direction: column;
+        }
+    }
+</style>
+{% endblock %}
+
+{% block body %}
+<div class="shell">
+    {% include "_admin_topbar.html" %}
+
+    <main class="page">
+        <section class="page-heading" aria-labelledby="users-title">
+            <div>
+                <h1 id="users-title">Пользователи</h1>
+                <p>Учётные записи сотрудников. Только superadmin может создавать и изменять пользователей.</p>
+            </div>
+        </section>
+
+        {% if saved %}<div class="notice" role="status">Изменения сохранены.</div>{% endif %}
+        {% if error %}<div class="error" role="alert">{{ error }}</div>{% endif %}
+
+        <section class="panel create-panel" aria-labelledby="create-user-title">
+            <h2 id="create-user-title">Добавить пользователя</h2>
+            <form class="form-grid" method="post" action="/admin/users/create">
+                <label>Имя
+                    <input name="display_name" autocomplete="name" required minlength="2" maxlength="100" placeholder="Айжан Садыкова">
+                </label>
+                <label>Логин
+                    <input name="username" autocomplete="off" required minlength="3" maxlength="64" placeholder="operator.almaty">
+                </label>
+                <label>Пароль
+                    <input name="password" type="password" autocomplete="new-password" required minlength="8" placeholder="Минимум 8 символов">
+                </label>
+                <label>Роль
+                    <select name="role" required>
+                        <option value="operator">Оператор</option>
+                        <option value="superadmin">Superadmin</option>
+                    </select>
+                </label>
+                <label>Номер WhatsApp
+                    <input name="whatsapp_id" inputmode="tel" autocomplete="tel" required placeholder="77001234567">
+                </label>
+                <button type="submit">Добавить</button>
+            </form>
+        </section>
+
+        {% if users %}
+            <section class="users-list" aria-label="Список пользователей">
+                {% for user in users %}
+                    <article class="panel user-card">
+                        <div class="user-card__heading">
+                            <h2>{{ user.display_name }}</h2>
+                            <div class="badges">
+                                <span class="badge">{{ user.username }}</span>
+                                <span class="badge">{{ "Superadmin" if user.role == "superadmin" else "Оператор" }}</span>
+                                <span class="badge">{{ "Активен" if user.is_active else "Отключён" }}</span>
+                                {% if user.receives_handoffs %}<span class="badge accent">Получает обращения</span>{% endif %}
+                            </div>
+                        </div>
+                        <form class="form-grid" method="post" action="/admin/users/{{ user.id }}/update">
+                            <label>Имя
+                                <input name="display_name" value="{{ user.display_name }}" required minlength="2" maxlength="100">
+                            </label>
+                            <label>Логин
+                                <input name="username" value="{{ user.username }}" required minlength="3" maxlength="64">
+                            </label>
+                            <label>Новый пароль
+                                <input name="password" type="password" autocomplete="new-password" minlength="8" placeholder="Оставьте пустым">
+                            </label>
+                            <label>Роль
+                                <select name="role" required>
+                                    <option value="operator" {% if user.role == "operator" %}selected{% endif %}>Оператор</option>
+                                    <option value="superadmin" {% if user.role == "superadmin" %}selected{% endif %}>Superadmin</option>
+                                </select>
+                            </label>
+                            <label>Номер WhatsApp
+                                <input name="whatsapp_id" inputmode="tel" autocomplete="tel" required value="{{ user.whatsapp_id or '' }}" placeholder="77001234567">
+                            </label>
+                            <div>
+                                <label class="checkbox-label">
+                                    <input type="checkbox" name="is_active" value="1" {% if user.is_active %}checked{% endif %}>
+                                    Активен
+                                </label>
+                                <button type="submit">Сохранить</button>
+                            </div>
+                        </form>
+                    </article>
+                {% endfor %}
+            </section>
+        {% else %}
+            <section class="panel empty"><p class="muted">Пользователей пока нет.</p></section>
+        {% endif %}
+    </main>
+</div>
+{% endblock %}

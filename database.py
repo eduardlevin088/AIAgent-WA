@@ -61,13 +61,23 @@ async def create_tables():
         CREATE TABLE IF NOT EXISTS admin_users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
+            display_name TEXT,
             password_hash TEXT NOT NULL,
             role TEXT NOT NULL DEFAULT 'operator',
             is_active INTEGER NOT NULL DEFAULT 1,
+            whatsapp_id TEXT,
+            receives_handoffs INTEGER NOT NULL DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    await ensure_column("admin_users", "display_name", "display_name TEXT")
+    await ensure_column("admin_users", "whatsapp_id", "whatsapp_id TEXT")
+    await ensure_column(
+        "admin_users",
+        "receives_handoffs",
+        "receives_handoffs INTEGER NOT NULL DEFAULT 0",
+    )
 
     # Media
     await db.execute("""
@@ -345,15 +355,138 @@ async def upsert_admin_user(username: str, password_hash: str, role: str = "supe
         raise RuntimeError("Database not initialized")
 
     await db.execute("""
-        INSERT INTO admin_users (username, password_hash, role, is_active)
-        VALUES (?, ?, ?, 1)
+        INSERT INTO admin_users (username, display_name, password_hash, role, is_active)
+        VALUES (?, ?, ?, ?, 1)
         ON CONFLICT(username) DO UPDATE SET
             password_hash = excluded.password_hash,
             role = excluded.role,
+            display_name = COALESCE(admin_users.display_name, excluded.display_name),
             is_active = 1,
             updated_at = CURRENT_TIMESTAMP
-    """, (username, password_hash, role))
+    """, (username, username, password_hash, role))
     await db.commit()
+
+
+async def create_admin_user(
+    username: str,
+    password_hash: str,
+    display_name: str,
+    role: str = "operator",
+    whatsapp_id: str = "",
+) -> int:
+    if db is None:
+        raise RuntimeError("Database not initialized")
+
+    try:
+        cursor = await db.execute("""
+            INSERT INTO admin_users (
+                username, display_name, password_hash, role, is_active, whatsapp_id
+            )
+            VALUES (?, ?, ?, ?, 1, ?)
+        """, (username, display_name.strip(), password_hash, role, whatsapp_id.strip()))
+        await db.commit()
+    except aiosqlite.IntegrityError as exc:
+        raise ValueError("Пользователь с таким логином уже существует") from exc
+    return int(cursor.lastrowid)
+
+
+async def update_admin_user(
+    admin_id: int,
+    username: str,
+    display_name: str,
+    role: str,
+    whatsapp_id: str | None,
+    is_active: bool,
+    password_hash: str | None = None,
+) -> bool:
+    if db is None:
+        raise RuntimeError("Database not initialized")
+
+    password_update = ", password_hash = ?" if password_hash else ""
+    params: list[object] = [
+        username,
+        display_name.strip(),
+        role,
+        whatsapp_id or None,
+        int(is_active),
+    ]
+    if password_hash:
+        params.append(password_hash)
+    params.append(admin_id)
+    try:
+        cursor = await db.execute(f"""
+            UPDATE admin_users
+            SET username = ?, display_name = ?, role = ?, whatsapp_id = ?, is_active = ?,
+                updated_at = CURRENT_TIMESTAMP{password_update}
+            WHERE id = ?
+        """, params)
+        if not is_active or not whatsapp_id:
+            await db.execute(
+                "UPDATE admin_users SET receives_handoffs = 0 WHERE id = ?",
+                (admin_id,),
+            )
+        await db.commit()
+    except aiosqlite.IntegrityError as exc:
+        raise ValueError("Пользователь с таким логином уже существует") from exc
+    return cursor.rowcount > 0
+
+
+async def list_admin_users() -> list[dict]:
+    if db is None:
+        raise RuntimeError("Database not initialized")
+
+    async with db.execute("""
+        SELECT id, username, display_name, role, is_active, whatsapp_id, receives_handoffs,
+               created_at, updated_at
+        FROM admin_users
+        ORDER BY username COLLATE NOCASE, id
+    """) as cursor:
+        rows = await cursor.fetchall()
+
+    users = [dict(row) for row in rows]
+    for user in users:
+        user["display_name"] = (user.get("display_name") or user["username"]).strip()
+        user["is_active"] = bool(user["is_active"])
+        user["receives_handoffs"] = bool(user["receives_handoffs"])
+    return users
+
+
+async def set_handoff_recipients(admin_ids: Sequence[int]) -> None:
+    if db is None:
+        raise RuntimeError("Database not initialized")
+
+    selected_ids = sorted(set(admin_ids))
+    await db.execute(
+        "UPDATE admin_users SET receives_handoffs = 0, updated_at = CURRENT_TIMESTAMP"
+    )
+    if selected_ids:
+        placeholders = ", ".join("?" for _ in selected_ids)
+        await db.execute(f"""
+            UPDATE admin_users
+            SET receives_handoffs = 1, updated_at = CURRENT_TIMESTAMP
+            WHERE id IN ({placeholders})
+              AND is_active = 1
+              AND whatsapp_id IS NOT NULL
+              AND TRIM(whatsapp_id) != ''
+        """, selected_ids)
+    await db.commit()
+
+
+async def get_handoff_recipient_ids() -> list[str]:
+    if db is None:
+        raise RuntimeError("Database not initialized")
+
+    async with db.execute("""
+        SELECT whatsapp_id
+        FROM admin_users
+        WHERE receives_handoffs = 1
+          AND is_active = 1
+          AND whatsapp_id IS NOT NULL
+          AND TRIM(whatsapp_id) != ''
+        ORDER BY username COLLATE NOCASE, id
+    """) as cursor:
+        rows = await cursor.fetchall()
+    return [str(row["whatsapp_id"]).strip() for row in rows]
 
 
 async def get_admin_user_by_username(username: str) -> dict | None:
@@ -361,13 +494,18 @@ async def get_admin_user_by_username(username: str) -> dict | None:
         raise RuntimeError("Database not initialized")
 
     async with db.execute("""
-        SELECT id, username, password_hash, role, is_active, created_at, updated_at
+        SELECT id, username, display_name, password_hash, role, is_active, whatsapp_id,
+               receives_handoffs, created_at, updated_at
         FROM admin_users
         WHERE username = ?
     """, (username,)) as cursor:
         row = await cursor.fetchone()
 
-    return dict(row) if row else None
+    if not row:
+        return None
+    user = dict(row)
+    user["display_name"] = (user.get("display_name") or user["username"]).strip()
+    return user
 
 
 async def get_admin_user_by_id(admin_id: int) -> dict | None:
@@ -375,13 +513,18 @@ async def get_admin_user_by_id(admin_id: int) -> dict | None:
         raise RuntimeError("Database not initialized")
 
     async with db.execute("""
-        SELECT id, username, password_hash, role, is_active, created_at, updated_at
+        SELECT id, username, display_name, password_hash, role, is_active, whatsapp_id,
+               receives_handoffs, created_at, updated_at
         FROM admin_users
         WHERE id = ?
     """, (admin_id,)) as cursor:
         row = await cursor.fetchone()
 
-    return dict(row) if row else None
+    if not row:
+        return None
+    user = dict(row)
+    user["display_name"] = (user.get("display_name") or user["username"]).strip()
+    return user
 
 
 async def save_file_id(user_id: str, file_id: str):
@@ -1206,16 +1349,50 @@ async def get_repair_request_stats() -> dict[str, int]:
     return stats
 
 
-async def update_repair_request_status(request_id: int, status: str) -> None:
+async def update_repair_request_status(request_id: int, status: str) -> dict:
     if db is None:
         raise RuntimeError("Database not initialized")
 
-    await db.execute("""
-        UPDATE repair_requests
-        SET status = ?, updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-    """, (status, request_id))
-    await db.commit()
+    while True:
+        async with db.execute("""
+            SELECT id, request_number, user_id, status
+            FROM repair_requests
+            WHERE id = ?
+        """, (request_id,)) as cursor:
+            row = await cursor.fetchone()
+
+        if not row:
+            return {
+                "application": None,
+                "changed": False,
+                "old_status": None,
+                "new_status": status,
+            }
+
+        application = dict(row)
+        old_status = application.get("status")
+        if old_status == status:
+            return {
+                "application": application,
+                "changed": False,
+                "old_status": old_status,
+                "new_status": status,
+            }
+
+        cursor = await db.execute("""
+            UPDATE repair_requests
+            SET status = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND status IS ?
+        """, (status, request_id, old_status))
+        await db.commit()
+        if cursor.rowcount:
+            application["status"] = status
+            return {
+                "application": application,
+                "changed": True,
+                "old_status": old_status,
+                "new_status": status,
+            }
 
 
 async def update_repair_request_status_by_deal_id(deal_id: int, status: str) -> int:

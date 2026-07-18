@@ -1,9 +1,13 @@
+import asyncio
+import json
 import os
 import unittest
 from datetime import timedelta
 from unittest.mock import AsyncMock, Mock
+from urllib.parse import urlencode
 
 import aiosqlite
+from starlette.requests import Request
 
 
 os.environ.setdefault("GPT_KEY", "test-key")
@@ -44,6 +48,40 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
                 "problem": "Wheel",
             },
             deal_id=deal_id,
+        )
+
+    async def get_request_id(self, deal_id: int = 42) -> int:
+        async with database.db.execute(
+            "SELECT id FROM repair_requests WHERE deal_id = ?",
+            (deal_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return int(row["id"])
+
+    def admin_request(self, form: dict[str, str], session_token: str) -> Request:
+        body = urlencode(form).encode("utf-8")
+
+        async def receive():
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        return Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/admin/applications/1/status",
+                "query_string": b"",
+                "headers": [
+                    (b"content-type", b"application/x-www-form-urlencoded"),
+                    (
+                        b"cookie",
+                        f"{bot.ADMIN_COOKIE_NAME}={session_token}".encode("ascii"),
+                    ),
+                ],
+                "scheme": "http",
+                "server": ("testserver", 80),
+                "client": ("testclient", 50000),
+            },
+            receive,
         )
 
     async def test_only_stage_beyond_furthest_is_advanced(self):
@@ -151,6 +189,232 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(forward_result)
         fake_wazzup.send_text.assert_awaited_once()
 
+    async def test_admin_status_change_returns_application_and_skips_duplicates(self):
+        await self.create_request()
+        request_id = await self.get_request_id()
+
+        changed = await database.update_repair_request_status(request_id, "В работе")
+        duplicate = await database.update_repair_request_status(request_id, "В работе")
+        missing = await database.update_repair_request_status(9999, "Готов")
+
+        self.assertTrue(changed["changed"])
+        self.assertEqual(changed["old_status"], "Принят")
+        self.assertEqual(changed["new_status"], "В работе")
+        self.assertEqual(changed["application"]["user_id"], "77000000000")
+        self.assertFalse(duplicate["changed"])
+        self.assertEqual(duplicate["old_status"], "В работе")
+        self.assertIsNone(missing["application"])
+
+    async def test_concurrent_admin_status_change_is_reported_once(self):
+        await self.create_request()
+        request_id = await self.get_request_id()
+
+        results = await asyncio.gather(
+            database.update_repair_request_status(request_id, "В работе"),
+            database.update_repair_request_status(request_id, "В работе"),
+        )
+
+        self.assertEqual(sum(int(result["changed"]) for result in results), 1)
+
+    async def test_admin_status_change_notifies_customer_and_records_audit(self):
+        await self.create_request()
+        request_id = await self.get_request_id()
+        change = await database.update_repair_request_status(request_id, "Готов")
+        fake_wazzup = Mock()
+        fake_wazzup.send_text = AsyncMock(return_value={"messageId": "status-message-1"})
+        original_wazzup = bot.wazzup
+        bot.wazzup = fake_wazzup
+        try:
+            sent = await bot.notify_customer_about_admin_status(
+                change,
+                admin={"id": 7, "username": "operator"},
+            )
+        finally:
+            bot.wazzup = original_wazzup
+
+        self.assertTrue(sent)
+        fake_wazzup.send_text.assert_awaited_once_with(
+            chat_id="77000000000",
+            text="Заявка 10500: готова к выдаче. Менеджер уточнит детали получения.",
+            channel_id="test-channel",
+            chat_type=bot.WAZZUP_CHAT_TYPE,
+        )
+        dialog = await database.get_recent_dialog("77000000000")
+        self.assertEqual(dialog[-1]["message_type"], "status")
+        self.assertEqual(dialog[-1]["text"], fake_wazzup.send_text.await_args.kwargs["text"])
+
+        async with database.db.execute(
+            "SELECT event_type, payload FROM analytics_events ORDER BY id DESC LIMIT 1"
+        ) as cursor:
+            event = await cursor.fetchone()
+        payload = json.loads(event["payload"])
+        self.assertEqual(event["event_type"], "admin_status_changed")
+        self.assertEqual(payload["admin_username"], "operator")
+        self.assertEqual(payload["old_status"], "Принят")
+        self.assertEqual(payload["new_status"], "Готов")
+        self.assertTrue(payload["notification_sent"])
+
+    async def test_admin_status_notification_failure_keeps_change_and_logs_failure(self):
+        await self.create_request()
+        request_id = await self.get_request_id()
+        change = await database.update_repair_request_status(request_id, "Диагностика")
+        fake_wazzup = Mock()
+        fake_wazzup.send_text = AsyncMock(side_effect=RuntimeError("Wazzup unavailable"))
+        original_wazzup = bot.wazzup
+        bot.wazzup = fake_wazzup
+        try:
+            with self.assertLogs("bot", level="ERROR"):
+                sent = await bot.notify_customer_about_admin_status(
+                    change,
+                    admin={"id": 7, "username": "operator"},
+                )
+        finally:
+            bot.wazzup = original_wazzup
+
+        self.assertFalse(sent)
+        async with database.db.execute(
+            "SELECT status FROM repair_requests WHERE id = ?",
+            (request_id,),
+        ) as cursor:
+            request = await cursor.fetchone()
+        self.assertEqual(request["status"], "Диагностика")
+
+        async with database.db.execute(
+            "SELECT payload FROM analytics_events ORDER BY id DESC LIMIT 1"
+        ) as cursor:
+            event = await cursor.fetchone()
+        payload = json.loads(event["payload"])
+        self.assertFalse(payload["notification_sent"])
+        self.assertEqual(payload["notification_error"], "Wazzup unavailable")
+
+    async def test_admin_applications_template_renders_status_controls(self):
+        await self.create_request()
+        applications = await database.list_repair_requests()
+
+        html = bot.templates.env.get_template("admin_applications.html").render(
+            admin={"username": "operator", "role": "operator"},
+            admin_sections=bot.ADMIN_SECTIONS,
+            active_section="applications",
+            applications=applications,
+            application_columns=bot.repair_request_columns(applications),
+            stats=await database.get_repair_request_stats(),
+            statuses=database.REPAIR_REQUEST_STATUSES,
+            q="",
+            current_path="/admin/applications",
+            current_query="q=10500",
+            notification_failed=True,
+        )
+
+        self.assertIn('action="/admin/applications/1/status"', html)
+        self.assertIn('aria-label="Статус заявки №10500"', html)
+        self.assertIn('<option value="Принят" selected>Принят</option>', html)
+        self.assertIn('value="/admin/applications?q=10500"', html)
+        self.assertIn("WhatsApp-уведомление не доставлено", html)
+
+    async def test_admin_status_route_updates_notifies_and_surfaces_delivery_failure(self):
+        await self.create_request()
+        request_id = await self.get_request_id()
+        await database.upsert_admin_user(
+            "operator",
+            "unused-test-hash",
+            role="operator",
+        )
+        admin = await database.get_admin_user_by_username("operator")
+        session_token = bot.sign_session(int(admin["id"]), bot.ADMIN_SESSION_SECRET)
+        request = self.admin_request(
+            {
+                "status": "Готов",
+                "next": "/admin/applications?q=10500",
+            },
+            session_token,
+        )
+        fake_wazzup = Mock()
+        fake_wazzup.send_text = AsyncMock(return_value={"messageId": "status-message-1"})
+        original_wazzup = bot.wazzup
+        bot.wazzup = fake_wazzup
+        try:
+            response = await bot.admin_application_status(request, request_id)
+
+            fake_wazzup.send_text.side_effect = RuntimeError("Wazzup unavailable")
+            failed_request = self.admin_request(
+                {
+                    "status": "Выдан",
+                    "next": "/admin/applications?q=10500",
+                },
+                session_token,
+            )
+            with self.assertLogs("bot", level="ERROR"):
+                failed_response = await bot.admin_application_status(failed_request, request_id)
+        finally:
+            bot.wazzup = original_wazzup
+
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response.headers["location"], "/admin/applications?q=10500")
+        self.assertEqual(failed_response.status_code, 303)
+        self.assertEqual(
+            failed_response.headers["location"],
+            "/admin/applications?q=10500&notification=failed",
+        )
+        async with database.db.execute(
+            "SELECT status FROM repair_requests WHERE id = ?",
+            (request_id,),
+        ) as cursor:
+            application = await cursor.fetchone()
+        self.assertEqual(application["status"], "Выдан")
+        self.assertEqual(fake_wazzup.send_text.await_count, 2)
+
+    async def test_admin_status_route_serializes_notifications_for_same_request(self):
+        await self.create_request()
+        request_id = await self.get_request_id()
+        await database.upsert_admin_user(
+            "operator",
+            "unused-test-hash",
+            role="operator",
+        )
+        admin = await database.get_admin_user_by_username("operator")
+        session_token = bot.sign_session(int(admin["id"]), bot.ADMIN_SESSION_SECRET)
+        first_started = asyncio.Event()
+        second_started = asyncio.Event()
+        release_first = asyncio.Event()
+        sent_statuses: list[str] = []
+
+        async def send_text(*, text: str, **kwargs):
+            if "находится в работе" in text:
+                first_started.set()
+                await release_first.wait()
+                sent_statuses.append("В работе")
+            else:
+                second_started.set()
+                sent_statuses.append("Готов")
+            return {"messageId": f"status-message-{len(sent_statuses)}"}
+
+        fake_wazzup = Mock()
+        fake_wazzup.send_text = AsyncMock(side_effect=send_text)
+        original_wazzup = bot.wazzup
+        bot.wazzup = fake_wazzup
+        first_task = asyncio.create_task(
+            bot.admin_application_status(
+                self.admin_request({"status": "В работе"}, session_token),
+                request_id,
+            )
+        )
+        await first_started.wait()
+        second_task = asyncio.create_task(
+            bot.admin_application_status(
+                self.admin_request({"status": "Готов"}, session_token),
+                request_id,
+            )
+        )
+        try:
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(second_started.wait(), timeout=0.05)
+        finally:
+            release_first.set()
+            await asyncio.gather(first_task, second_task)
+            bot.wazzup = original_wazzup
+
+        self.assertEqual(sent_statuses, ["В работе", "Готов"])
+
     async def test_manager_first_response_is_recorded_once(self):
         handoff = await database.create_operator_handoff(
             "77000000000",
@@ -255,6 +519,175 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await database.is_bot_paused("77000000000"))
         self.assertEqual(handoff["total"], 1)
         self.assertEqual(handoff["last_manager_message_at"], first_message_at.isoformat())
+
+    async def test_admin_users_and_handoff_recipient_selection(self):
+        first_id = await database.create_admin_user(
+            username="operator.one",
+            password_hash="hash-one",
+            display_name="Operator One",
+            role="operator",
+            whatsapp_id="77000000001",
+        )
+        second_id = await database.create_admin_user(
+            username="operator.two",
+            password_hash="hash-two",
+            display_name="Operator Two",
+            role="operator",
+            whatsapp_id="77000000002",
+        )
+
+        await database.set_handoff_recipients([second_id])
+
+        users = await database.list_admin_users()
+        self.assertEqual([user["username"] for user in users], ["operator.one", "operator.two"])
+        self.assertFalse(users[0]["receives_handoffs"])
+        self.assertTrue(users[1]["receives_handoffs"])
+        self.assertEqual(await database.get_handoff_recipient_ids(), ["77000000002"])
+
+        await database.update_admin_user(
+            second_id,
+            username="operator.two",
+            display_name="Operator Two",
+            role="operator",
+            whatsapp_id="77000000002",
+            is_active=False,
+        )
+        self.assertEqual(await database.get_handoff_recipient_ids(), [])
+
+    async def test_handoff_notifications_use_selected_users_with_legacy_fallback(self):
+        await database.create_admin("legacy-admin")
+        operator_id = await database.create_admin_user(
+            username="operator",
+            password_hash="hash",
+            display_name="Selected Operator",
+            role="operator",
+            whatsapp_id="selected-admin",
+        )
+        send_text = AsyncMock()
+
+        with unittest.mock.patch.object(bot.wazzup, "send_text", send_text):
+            await bot.notify_handoff_recipients("handoff", "channel", "whatsapp")
+            await database.set_handoff_recipients([operator_id])
+            await bot.notify_handoff_recipients("handoff", "channel", "whatsapp")
+
+        self.assertEqual(
+            [call.kwargs["chat_id"] for call in send_text.await_args_list],
+            ["legacy-admin", "selected-admin"],
+        )
+
+    async def test_only_superadmin_can_manage_users_but_operator_can_change_settings(self):
+        await database.upsert_admin_user("owner", "owner-hash", role="superadmin")
+        await database.upsert_admin_user("operator", "operator-hash", role="operator")
+        owner = await database.get_admin_user_by_username("owner")
+        operator = await database.get_admin_user_by_username("operator")
+        recipient_id = await database.create_admin_user(
+            username="recipient",
+            password_hash="recipient-hash",
+            display_name="Айжан Садыкова",
+            role="operator",
+            whatsapp_id="77000000003",
+        )
+        operator_session = bot.sign_session(int(operator["id"]), bot.ADMIN_SESSION_SECRET)
+        request = self.admin_request({}, operator_session)
+
+        settings_response = await bot.admin_settings(request)
+        settings_save_response = await bot.admin_settings_handoff_recipients(
+            self.admin_request({"recipient_id": str(recipient_id)}, operator_session)
+        )
+
+        with self.assertRaises(bot.HTTPException) as users_error:
+            await bot.admin_users_page(request)
+        with self.assertRaises(bot.HTTPException) as create_error:
+            await bot.admin_user_create(
+                self.admin_request(
+                    {
+                        "display_name": "Новый пользователь",
+                        "username": "new.user",
+                        "password": "password123",
+                        "role": "operator",
+                        "whatsapp_id": "77000000004",
+                    },
+                    operator_session,
+                )
+            )
+
+        self.assertEqual(settings_response.status_code, 200)
+        self.assertEqual(settings_save_response.status_code, 303)
+        self.assertEqual(await database.get_handoff_recipient_ids(), ["77000000003"])
+        self.assertEqual(users_error.exception.status_code, 403)
+        self.assertEqual(create_error.exception.status_code, 403)
+        self.assertEqual(owner["role"], "superadmin")
+
+    async def test_superadmin_creates_user_with_required_name_role_and_phone(self):
+        await database.upsert_admin_user("owner", "owner-hash", role="superadmin")
+        owner = await database.get_admin_user_by_username("owner")
+        owner_session = bot.sign_session(int(owner["id"]), bot.ADMIN_SESSION_SECRET)
+
+        response = await bot.admin_user_create(
+            self.admin_request(
+                {
+                    "display_name": "Айжан Садыкова",
+                    "username": "a.sadykova",
+                    "password": "password123",
+                    "role": "operator",
+                    "whatsapp_id": "+7 (700) 000-00-05",
+                },
+                owner_session,
+            )
+        )
+        created = await database.get_admin_user_by_username("a.sadykova")
+
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(created["display_name"], "Айжан Садыкова")
+        self.assertEqual(created["role"], "operator")
+        self.assertEqual(created["whatsapp_id"], "77000000005")
+
+    async def test_superadmin_cannot_create_user_without_name_role_or_phone(self):
+        await database.upsert_admin_user("owner", "owner-hash", role="superadmin")
+        owner = await database.get_admin_user_by_username("owner")
+        owner_session = bot.sign_session(int(owner["id"]), bot.ADMIN_SESSION_SECRET)
+        valid_form = {
+            "display_name": "Айжан Садыкова",
+            "username": "required.fields",
+            "password": "password123",
+            "role": "operator",
+            "whatsapp_id": "77000000005",
+        }
+
+        for missing_field in ("display_name", "role", "whatsapp_id"):
+            with self.subTest(missing_field=missing_field):
+                form = {**valid_form, missing_field: ""}
+                response = await bot.admin_user_create(
+                    self.admin_request(form, owner_session)
+                )
+                self.assertEqual(response.status_code, 400)
+
+        self.assertIsNone(
+            await database.get_admin_user_by_username(valid_form["username"])
+        )
+
+    async def test_handoff_settings_show_only_recipient_names(self):
+        html = bot.templates.env.get_template("admin_settings.html").render(
+            admin={"username": "owner", "role": "superadmin"},
+            admin_sections=bot.ADMIN_SECTIONS,
+            active_section="settings",
+            users=[{
+                "id": 7,
+                "username": "internal.login",
+                "display_name": "Айжан Садыкова",
+                "role": "operator",
+                "whatsapp_id": "77000000003",
+                "receives_handoffs": True,
+            }],
+            saved=False,
+        )
+
+        self.assertIn('name="recipient_id"', html)
+        self.assertIn("Передача диалога оператору", html)
+        self.assertIn("Айжан Садыкова", html)
+        self.assertNotIn("internal.login", html)
+        self.assertNotIn("77000000003", html)
+        self.assertNotIn('name="recipient_ids"', html)
 
     async def test_wazzup_client_registers_api_message_id_before_echo(self):
         class FakeResponse:

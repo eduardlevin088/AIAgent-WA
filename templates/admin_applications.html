@@ -41,6 +41,10 @@
         margin-bottom: 16px;
     }
 
+    .delivery-error {
+        margin-bottom: 16px;
+    }
+
     .board-wrap {
         overflow-x: auto;
         padding-bottom: 8px;
@@ -182,6 +186,30 @@
         line-height: 1.35;
     }
 
+    .status-form {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 8px;
+        padding-top: 2px;
+    }
+
+    .status-form button {
+        padding-inline: 12px;
+        white-space: nowrap;
+    }
+
+    .visually-hidden {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        padding: 0;
+        margin: -1px;
+        overflow: hidden;
+        clip: rect(0, 0, 0, 0);
+        white-space: nowrap;
+        border: 0;
+    }
+
     .bitrix-link {
         font-weight: 700;
         white-space: nowrap;
@@ -250,6 +278,10 @@
         .lead-date {
             text-align: left;
         }
+
+        .status-form {
+            grid-template-columns: 1fr;
+        }
     }
 </style>
 {% endblock %}
@@ -265,6 +297,12 @@
                 <p>Рабочая очередь обращений из WhatsApp, сгруппированная по текущему статусу.</p>
             </div>
         </section>
+
+        {% if notification_failed %}
+            <div class="error delivery-error" role="alert">
+                Статус сохранён, но WhatsApp-уведомление не доставлено. Отправьте сообщение клиенту вручную через Wazzup.
+            </div>
+        {% endif %}
 
         <section class="summary-strip" aria-label="Сводка по статусам">
             <div class="summary-item">
@@ -340,6 +378,23 @@
                                                     <span>нет сделки</span>
                                                 {% endif %}
                                             </div>
+
+                                            <form class="status-form" method="post" action="/admin/applications/{{ app.id }}/status">
+                                                <input
+                                                    type="hidden"
+                                                    name="next"
+                                                    value="{{ current_path }}{% if current_query %}?{{ current_query }}{% endif %}"
+                                                >
+                                                <label class="visually-hidden" for="status-{{ app.id }}">
+                                                    Статус заявки №{{ app.request_number or app.id }}
+                                                </label>
+                                                <select id="status-{{ app.id }}" name="status" aria-label="Статус заявки №{{ app.request_number or app.id }}">
+                                                    {% for status in statuses %}
+                                                        <option value="{{ status }}" {% if status == app.status %}selected{% endif %}>{{ status }}</option>
+                                                    {% endfor %}
+                                                </select>
+                                                <button type="submit">Обновить</button>
+                                            </form>
                                         </article>
                                     {% endfor %}
                                 {% else %}
