@@ -29,15 +29,18 @@ from database import create_admin, create_operator_handoff
 from database import create_or_update_user, delete_admin, execute_query, get_admin_ids
 from database import create_admin_user, get_admin_user_by_id, get_admin_user_by_username
 from database import get_analytics_summary, get_handoff_recipient_ids
+from database import get_notification_template_text, get_repair_request_group_stats
 from database import get_media_files, get_operator_handoff_stats, get_recent_dialog
 from database import get_repair_request_stats
 from database import get_token_usage, get_user_conversation, get_users, init_db
 from database import is_bot_paused, list_admin_users, list_customers, list_repair_requests
+from database import list_notification_templates
 from database import log_event, mark_message_processed
 from database import record_operator_message, REPAIR_REQUEST_STATUSES, save_feedback
 from database import save_media_file, set_bot_paused, set_handoff_recipients
 from database import sync_repair_request_status_by_deal_id
 from database import update_admin_user, upsert_admin_user
+from database import update_notification_templates
 from services.agent import generate_response, transcribe
 from services.admin_auth import hash_password, sign_session, verify_password, verify_session
 from services.integrations import get_bitrix_deal_stage_id, upload_files_to_bitrix
@@ -164,14 +167,6 @@ ADMIN_SECTIONS = [
     {"id": "settings", "label": "Настройки", "href": "/admin/settings"},
     {"id": "users", "label": "Пользователи", "href": "/admin/users"},
 ]
-BITRIX_NOTIFICATION_TEMPLATE_STAGES = [
-    {"stage_id": "C5:PREPARATION", "stage_name": "Передан в сервисный центр"},
-    {"stage_id": "C5:PREPAYMENT_INVOICE", "stage_name": "Заказ запчастей"},
-    {"stage_id": "C5:EXECUTING", "stage_name": "Чемодан в ремонте"},
-    {"stage_id": "C5:FINAL_INVOICE", "stage_name": "Готов к выдаче"},
-]
-
-
 def require_internal_api_key(x_api_key: str | None = Header(default=None)) -> None:
     if INTERNAL_API_KEY and x_api_key != INTERNAL_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
@@ -472,7 +467,7 @@ async def notify_customer_about_bitrix_status(
         return False
 
     request_number = application.get("request_number")
-    text = bitrix_stage_notification_text(stage_id)
+    text = await get_notification_template_text(stage_id)
     if not text:
         return False
     try:
@@ -601,55 +596,18 @@ def status_notification_text(status: str, request_number: str | None = None) -> 
     return prefix + mapping.get(normalized, f"статус изменен: {status}.")
 
 
-def bitrix_stage_notification_text(stage_id: str | None) -> str | None:
-    if not stage_id:
-        return None
-
-    mapping = {
-        "C5:PREPARATION": (
-            "Здравствуйте!\n"
-            "Информируем вас об изменении статуса вашей заявки\n"
-            "Статус заявки: передана мастеру сервисного центра для осмотра"
-        ),
-        "C5:PREPAYMENT_INVOICE": (
-            "Здравствуйте!\n"
-            "Статус заявки: запчасть заказана из Бельгии. Ориентировочный срок поставки составляет 2–3 месяца. "
-            "По поступлении запчасти мы сразу свяжемся с вами"
-        ),
-        "C5:EXECUTING": (
-            "Здравствуйте!\n"
-            "Статус заявки: ваше изделие находится в ремонте и обслуживается в порядке очереди. "
-            "По готовности мы обязательно сообщим вам."
-        ),
-        "C5:FINAL_INVOICE": (
-            "Здравствуйте!\n"
-            "Благодарим за обращение в наш сервисный центр. Информируем вас об изменении статуса вашей заявки\n"
-            "Статус заявки: ваше изделие поступило в бутик и готово к выдаче. "
-            "Стоимость ремонта вы можете уточнить в данном диалоге."
-        ),
-    }
-    return mapping.get(stage_id.strip())
-
-
-def bitrix_notification_template_rows() -> list[dict[str, str]]:
+def repair_group_stat_rows(
+    grouped_stats: list[dict[str, int | str]],
+    total: int,
+) -> list[dict[str, Any]]:
+    denominator = max(total, 1)
     return [
         {
-            **stage,
-            "text": bitrix_stage_notification_text(stage["stage_id"]) or "",
+            "label": str(row["label"]),
+            "count": int(row["count"]),
+            "percent": round((int(row["count"]) / denominator) * 100, 1),
         }
-        for stage in BITRIX_NOTIFICATION_TEMPLATE_STAGES
-    ]
-
-
-def repair_status_stat_rows(stats: dict[str, int]) -> list[dict[str, Any]]:
-    total = max(stats.get("Все", 0), 1)
-    return [
-        {
-            "status": status,
-            "count": stats.get(status, 0),
-            "percent": round((stats.get(status, 0) / total) * 100, 1),
-        }
-        for status in REPAIR_REQUEST_STATUSES
+        for row in grouped_stats
     ]
 
 
@@ -1470,9 +1428,83 @@ async def admin_templates_page(request: Request):
     if not admin:
         return admin_login_redirect(request)
 
+    return await render_admin_templates(request, admin)
+
+
+async def render_admin_templates(
+    request: Request,
+    admin: dict[str, Any],
+    error: str | None = None,
+    template_texts: dict[str, str] | None = None,
+    status_code: int = 200,
+):
+    notification_templates = await list_notification_templates()
+    if template_texts is not None:
+        notification_templates = [
+            {
+                **item,
+                "text": template_texts.get(item["stage_id"], item["text"]),
+            }
+            for item in notification_templates
+        ]
+
     context = admin_template_context(request, admin, "templates")
-    context["notification_templates"] = bitrix_notification_template_rows()
-    return templates.TemplateResponse("admin_templates.html", context)
+    context.update({
+        "notification_templates": notification_templates,
+        "saved": request.query_params.get("saved") == "1",
+        "error": error,
+    })
+    return templates.TemplateResponse(
+        "admin_templates.html",
+        context,
+        status_code=status_code,
+    )
+
+
+@app.post("/admin/templates", response_class=HTMLResponse)
+async def admin_templates_save(request: Request):
+    admin = await current_admin(request)
+    if not admin:
+        return RedirectResponse("/admin/login", status_code=303)
+
+    form = await parse_urlencoded_form(request)
+    configured_templates = await list_notification_templates()
+    template_texts = {
+        item["stage_id"]: (form.get(f"template_{item['stage_id']}") or "").strip()
+        for item in configured_templates
+    }
+    invalid_template = next(
+        (
+            item
+            for item in configured_templates
+            if not template_texts[item["stage_id"]]
+            or len(template_texts[item["stage_id"]]) > 4096
+        ),
+        None,
+    )
+    if invalid_template:
+        return await render_admin_templates(
+            request,
+            admin,
+            error=f"Шаблон «{invalid_template['stage_name']}» должен содержать от 1 до 4096 символов",
+            template_texts=template_texts,
+            status_code=400,
+        )
+
+    await update_notification_templates(template_texts)
+    await log_event(
+        None,
+        "notification_templates_updated",
+        json.dumps(
+            {
+                "admin_id": admin.get("id"),
+                "admin_username": admin.get("username"),
+                "stage_ids": list(template_texts),
+            },
+            ensure_ascii=False,
+        ),
+    )
+    return RedirectResponse("/admin/templates?saved=1", status_code=303)
 
 
 @app.get("/admin/statistics", response_class=HTMLResponse)
@@ -1481,14 +1513,21 @@ async def admin_statistics(request: Request):
     if not admin:
         return admin_login_redirect(request)
 
+    group_by = (request.query_params.get("group_by") or "status").strip().lower()
+    if group_by not in {"status", "city"}:
+        group_by = "status"
+
     stats = await get_repair_request_stats()
+    grouped_stats = await get_repair_request_group_stats(group_by)
     handoff_stats = await get_operator_handoff_stats()
     analytics_summary = await get_analytics_summary()
     context = admin_template_context(request, admin, "statistics")
     context.update(
         {
             "stats": stats,
-            "status_rows": repair_status_stat_rows(stats),
+            "group_by": group_by,
+            "grouping_title": "Заявки по городу" if group_by == "city" else "Заявки по статусу",
+            "group_rows": repair_group_stat_rows(grouped_stats, stats.get("Все", 0)),
             "handoff_stats": handoff_stats,
             "average_manager_response": format_duration(handoff_stats.get("average_seconds")),
             "maximum_manager_response": format_duration(handoff_stats.get("maximum_seconds")),

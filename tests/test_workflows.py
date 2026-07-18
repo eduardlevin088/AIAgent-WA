@@ -33,13 +33,18 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         await database.db.close()
         database.db = self.previous_db
 
-    async def create_request(self, deal_id: int = 42) -> None:
+    async def create_request(
+        self,
+        deal_id: int = 42,
+        city: str = "Almaty",
+        user_id: str = "77000000000",
+    ) -> None:
         await database.create_repair_request(
-            user_id="77000000000",
+            user_id=user_id,
             data={
                 "name": "Test Customer",
-                "phone": "77000000000",
-                "city": "Almaty",
+                "phone": user_id,
+                "city": city,
                 "service_type": "Repair",
                 "product_type": "Suitcase",
                 "model": "Test",
@@ -47,6 +52,26 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
             },
             deal_id=deal_id,
         )
+
+    def admin_get_request(
+        self,
+        path: str,
+        query: dict[str, str],
+        session_token: str,
+    ) -> Request:
+        return Request({
+            "type": "http",
+            "method": "GET",
+            "path": path,
+            "query_string": urlencode(query).encode("utf-8"),
+            "headers": [(
+                b"cookie",
+                f"{bot.ADMIN_COOKIE_NAME}={session_token}".encode("ascii"),
+            )],
+            "scheme": "http",
+            "server": ("testserver", 80),
+            "client": ("testclient", 50000),
+        })
 
     def admin_request(self, form: dict[str, str], session_token: str) -> Request:
         body = urlencode(form).encode("utf-8")
@@ -204,6 +229,97 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("/admin/applications/1/status", html)
         self.assertNotIn('name="status"', html)
         self.assertNotIn(">Обновить</button>", html)
+
+    async def test_statistics_can_group_applications_by_city(self):
+        await self.create_request(deal_id=42, city="Алматы", user_id="77000000001")
+        await self.create_request(deal_id=43, city="Алматы", user_id="77000000002")
+        await self.create_request(deal_id=44, city="Астана", user_id="77000000003")
+        await self.create_request(deal_id=45, city="", user_id="77000000004")
+
+        city_groups = await database.get_repair_request_group_stats("city")
+
+        self.assertEqual(
+            {row["label"]: row["count"] for row in city_groups},
+            {"Алматы": 2, "Астана": 1, "Не указан": 1},
+        )
+
+    async def test_statistics_route_preserves_city_grouping_choice(self):
+        await self.create_request(city="Алматы")
+        await database.upsert_admin_user("operator", "unused-hash", role="operator")
+        admin = await database.get_admin_user_by_username("operator")
+        session = bot.sign_session(int(admin["id"]), bot.ADMIN_SESSION_SECRET)
+
+        response = await bot.admin_statistics(
+            self.admin_get_request(
+                "/admin/statistics",
+                {"group_by": "city"},
+                session,
+            )
+        )
+        html = response.body.decode("utf-8")
+
+        self.assertIn('name="group_by"', html)
+        self.assertIn('<option value="city" selected>Город</option>', html)
+        self.assertIn("Заявки по городу", html)
+        self.assertIn("Алматы", html)
+
+    async def test_templates_are_edited_together_and_used_for_notifications(self):
+        await self.create_request()
+        await database.upsert_admin_user("operator", "unused-hash", role="operator")
+        admin = await database.get_admin_user_by_username("operator")
+        session = bot.sign_session(int(admin["id"]), bot.ADMIN_SESSION_SECRET)
+        templates = await database.list_notification_templates()
+        updated_texts = {
+            item["stage_id"]: f"Обновлённый текст: {item['stage_name']}"
+            for item in templates
+        }
+
+        response = await bot.admin_templates_save(
+            self.admin_request(
+                {
+                    f"template_{stage_id}": text
+                    for stage_id, text in updated_texts.items()
+                },
+                session,
+            )
+        )
+        saved_templates = await database.list_notification_templates()
+        saved_html = bot.templates.env.get_template("admin_templates.html").render(
+            admin={"username": "operator", "role": "operator"},
+            admin_sections=bot.ADMIN_SECTIONS,
+            active_section="templates",
+            notification_templates=saved_templates,
+            saved=True,
+            error=None,
+        )
+        fake_wazzup = Mock()
+        fake_wazzup.send_text = AsyncMock(return_value={})
+        original_wazzup = bot.wazzup
+        bot.wazzup = fake_wazzup
+        try:
+            sent = await bot.notify_customer_about_bitrix_status(
+                {
+                    "application": {
+                        "user_id": "77000000000",
+                        "request_number": 10500,
+                    },
+                    "stage_advanced": True,
+                    "new_status": "Диагностика",
+                },
+                stage_id="C5:PREPARATION",
+            )
+        finally:
+            bot.wazzup = original_wazzup
+
+        self.assertEqual(response.status_code, 303)
+        self.assertTrue(sent)
+        self.assertEqual(
+            fake_wazzup.send_text.await_args.kwargs["text"],
+            updated_texts["C5:PREPARATION"],
+        )
+        self.assertEqual(saved_html.count("<textarea"), len(templates))
+        self.assertEqual(saved_html.count(">Сохранить</button>"), 1)
+        self.assertIn("Шаблоны сохранены", saved_html)
 
     async def test_manager_first_response_is_recorded_once(self):
         handoff = await database.create_operator_handoff(

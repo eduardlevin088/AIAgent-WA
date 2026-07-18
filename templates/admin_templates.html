@@ -32,6 +32,19 @@
         line-height: 1.2;
     }
 
+    .notice {
+        margin-bottom: 16px;
+        padding: 12px 14px;
+        color: var(--accent);
+        background: rgba(15, 111, 104, 0.08);
+        border: 1px solid rgba(15, 111, 104, 0.2);
+        border-radius: var(--radius);
+    }
+
+    .error {
+        margin-bottom: 16px;
+    }
+
     .stage-code {
         color: var(--muted);
         font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -39,20 +52,43 @@
         white-space: nowrap;
     }
 
-    .message-preview {
+    .message-label {
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 700;
+    }
+
+    .message-editor {
+        width: 100%;
         min-height: 140px;
         padding: 14px;
         color: #2d2f32;
         background: var(--surface-strong);
         border: 1px solid var(--line);
         border-radius: 7px;
+        font: inherit;
         line-height: 1.45;
-        white-space: pre-line;
+        resize: vertical;
+    }
+
+    .message-editor:focus {
+        outline: 3px solid rgba(15, 111, 104, 0.22);
+        outline-offset: 2px;
+    }
+
+    .template-actions {
+        display: flex;
+        justify-content: flex-end;
+        grid-column: 1 / -1;
     }
 
     @media (max-width: 900px) {
         .template-grid {
             grid-template-columns: 1fr;
+        }
+
+        .template-actions button {
+            width: 100%;
         }
     }
 </style>
@@ -70,17 +106,30 @@
             </div>
         </section>
 
-        <section class="template-grid" aria-label="Шаблоны уведомлений">
+        {% if saved %}<div class="notice" role="status">Шаблоны сохранены.</div>{% endif %}
+        {% if error %}<div class="error" role="alert">{{ error }}</div>{% endif %}
+
+        <form class="template-grid" method="post" action="/admin/templates" aria-label="Шаблоны уведомлений">
             {% for item in notification_templates %}
                 <article class="template-card">
                     <header>
                         <h2>{{ item.stage_name }}</h2>
                         <span class="stage-code">{{ item.stage_id }}</span>
                     </header>
-                    <div class="message-preview">{{ item.text }}</div>
+                    <label class="message-label" for="template-{{ loop.index }}">Текст сообщения</label>
+                    <textarea
+                        class="message-editor"
+                        id="template-{{ loop.index }}"
+                        name="template_{{ item.stage_id }}"
+                        required
+                        maxlength="4096"
+                    >{{ item.text }}</textarea>
                 </article>
             {% endfor %}
-        </section>
+            <div class="template-actions">
+                <button type="submit">Сохранить</button>
+            </div>
+        </form>
     </main>
 </div>
 {% endblock %}

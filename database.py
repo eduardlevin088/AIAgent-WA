@@ -14,6 +14,46 @@ logger = logging.getLogger(__name__)
 db: Optional[aiosqlite.Connection] = None
 _handoff_operation_lock = asyncio.Lock()
 
+DEFAULT_NOTIFICATION_TEMPLATES = (
+    {
+        "stage_id": "C5:PREPARATION",
+        "stage_name": "Передан в сервисный центр",
+        "text": (
+            "Здравствуйте!\n"
+            "Информируем вас об изменении статуса вашей заявки\n"
+            "Статус заявки: передана мастеру сервисного центра для осмотра"
+        ),
+    },
+    {
+        "stage_id": "C5:PREPAYMENT_INVOICE",
+        "stage_name": "Заказ запчастей",
+        "text": (
+            "Здравствуйте!\n"
+            "Статус заявки: запчасть заказана из Бельгии. Ориентировочный срок поставки составляет 2–3 месяца. "
+            "По поступлении запчасти мы сразу свяжемся с вами"
+        ),
+    },
+    {
+        "stage_id": "C5:EXECUTING",
+        "stage_name": "Чемодан в ремонте",
+        "text": (
+            "Здравствуйте!\n"
+            "Статус заявки: ваше изделие находится в ремонте и обслуживается в порядке очереди. "
+            "По готовности мы обязательно сообщим вам."
+        ),
+    },
+    {
+        "stage_id": "C5:FINAL_INVOICE",
+        "stage_name": "Готов к выдаче",
+        "text": (
+            "Здравствуйте!\n"
+            "Благодарим за обращение в наш сервисный центр. Информируем вас об изменении статуса вашей заявки\n"
+            "Статус заявки: ваше изделие поступило в бутик и готово к выдаче. "
+            "Стоимость ремонта вы можете уточнить в данном диалоге."
+        ),
+    },
+)
+
 
 async def init_db():
     global db
@@ -78,6 +118,26 @@ async def create_tables():
         "receives_handoffs",
         "receives_handoffs INTEGER NOT NULL DEFAULT 0",
     )
+
+    # Editable customer notifications for Bitrix stage changes.
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS notification_templates (
+            stage_id TEXT PRIMARY KEY,
+            stage_name TEXT NOT NULL,
+            text TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    await db.executemany("""
+        INSERT INTO notification_templates (stage_id, stage_name, text)
+        VALUES (?, ?, ?)
+        ON CONFLICT(stage_id) DO UPDATE SET
+            stage_name = excluded.stage_name
+    """, [
+        (item["stage_id"], item["stage_name"], item["text"])
+        for item in DEFAULT_NOTIFICATION_TEMPLATES
+    ])
 
     # Media
     await db.execute("""
@@ -1347,6 +1407,91 @@ async def get_repair_request_stats() -> dict[str, int]:
 
     stats["Все"] = total
     return stats
+
+
+async def get_repair_request_group_stats(group_by: str) -> list[dict[str, int | str]]:
+    if db is None:
+        raise RuntimeError("Database not initialized")
+    if group_by not in {"status", "city"}:
+        raise ValueError("Unsupported repair request grouping")
+
+    expression = (
+        "COALESCE(NULLIF(TRIM(status), ''), 'Без статуса')"
+        if group_by == "status"
+        else "COALESCE(NULLIF(TRIM(city), ''), 'Не указан')"
+    )
+    async with db.execute(f"""
+        SELECT {expression} AS label, COUNT(*) AS count
+        FROM repair_requests
+        GROUP BY {expression}
+        ORDER BY count DESC, label COLLATE NOCASE
+    """) as cursor:
+        rows = await cursor.fetchall()
+
+    counts = {str(row["label"]): int(row["count"] or 0) for row in rows}
+    if group_by == "city":
+        return [
+            {"label": label, "count": count}
+            for label, count in counts.items()
+        ]
+
+    result = [
+        {"label": status, "count": counts.pop(status, 0)}
+        for status in REPAIR_REQUEST_STATUSES
+    ]
+    result.extend(
+        {"label": label, "count": count}
+        for label, count in counts.items()
+    )
+    return result
+
+
+async def list_notification_templates() -> list[dict[str, str]]:
+    if db is None:
+        raise RuntimeError("Database not initialized")
+
+    async with db.execute("""
+        SELECT stage_id, stage_name, text
+        FROM notification_templates
+        ORDER BY rowid
+    """) as cursor:
+        rows = await cursor.fetchall()
+    return [dict(row) for row in rows]
+
+
+async def get_notification_template_text(stage_id: str | None) -> str | None:
+    if db is None:
+        raise RuntimeError("Database not initialized")
+    if not stage_id:
+        return None
+
+    async with db.execute("""
+        SELECT text
+        FROM notification_templates
+        WHERE stage_id = ?
+    """, (stage_id.strip().upper(),)) as cursor:
+        row = await cursor.fetchone()
+    return str(row["text"]) if row else None
+
+
+async def update_notification_templates(template_texts: dict[str, str]) -> None:
+    if db is None:
+        raise RuntimeError("Database not initialized")
+
+    known_templates = await list_notification_templates()
+    known_stage_ids = {item["stage_id"] for item in known_templates}
+    if set(template_texts) != known_stage_ids:
+        raise ValueError("Template set does not match configured Bitrix stages")
+
+    await db.executemany("""
+        UPDATE notification_templates
+        SET text = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE stage_id = ?
+    """, [
+        (text, stage_id)
+        for stage_id, text in template_texts.items()
+    ])
+    await db.commit()
 
 
 async def update_repair_request_status_by_deal_id(deal_id: int, status: str) -> int:

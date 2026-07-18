@@ -48,22 +48,51 @@
         align-items: start;
     }
 
-    .status-list,
+    .group-list,
     .export-panel,
     .analytics-panel {
         padding: 16px;
     }
 
-    .status-row {
+    .grouping-header {
+        display: flex;
+        align-items: flex-end;
+        justify-content: space-between;
+        gap: 16px;
+        padding-bottom: 12px;
+        border-bottom: 1px solid var(--line);
+    }
+
+    .grouping-header h2 {
+        margin: 0;
+        font-size: 20px;
+    }
+
+    .grouping-form {
         display: grid;
-        grid-template-columns: 150px minmax(0, 1fr) 60px;
+        grid-template-columns: minmax(150px, 190px) auto;
+        gap: 8px;
+        align-items: end;
+    }
+
+    .grouping-form label {
+        display: grid;
+        gap: 6px;
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 700;
+    }
+
+    .group-row {
+        display: grid;
+        grid-template-columns: minmax(150px, 210px) minmax(0, 1fr) 60px;
         gap: 10px;
         align-items: center;
         min-height: 38px;
         border-bottom: 1px solid var(--line);
     }
 
-    .status-row:last-child {
+    .group-row:last-child {
         border-bottom: 0;
     }
 
@@ -98,6 +127,26 @@
         .metrics.metrics--manager,
         .content-grid {
             grid-template-columns: 1fr;
+        }
+
+        .grouping-header {
+            align-items: stretch;
+            flex-direction: column;
+        }
+
+        .grouping-form {
+            grid-template-columns: minmax(0, 1fr) auto;
+        }
+    }
+
+    @media (max-width: 560px) {
+        .grouping-form,
+        .group-row {
+            grid-template-columns: 1fr;
+        }
+
+        .grouping-form button {
+            width: 100%;
         }
     }
 </style>
@@ -159,11 +208,23 @@
         </section>
 
         <section class="content-grid">
-            <div class="panel status-list">
-                {% for row in status_rows %}
-                    <div class="status-row">
-                        <strong>{{ row.status }}</strong>
-                        <div class="bar" aria-label="{{ row.status }} {{ row.percent }}%">
+            <div class="panel group-list">
+                <div class="grouping-header">
+                    <h2>{{ grouping_title }}</h2>
+                    <form class="grouping-form" method="get" action="/admin/statistics">
+                        <label>Группировать по
+                            <select name="group_by">
+                                <option value="status" {% if group_by == "status" %}selected{% endif %}>Статус</option>
+                                <option value="city" {% if group_by == "city" %}selected{% endif %}>Город</option>
+                            </select>
+                        </label>
+                        <button type="submit">Применить</button>
+                    </form>
+                </div>
+                {% for row in group_rows %}
+                    <div class="group-row">
+                        <strong>{{ row.label }}</strong>
+                        <div class="bar" aria-label="{{ row.label }} {{ row.percent }}%">
                             <span style="width: {{ row.percent }}%;"></span>
                         </div>
                         <span>{{ row.count }}</span>
