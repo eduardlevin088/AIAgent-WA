@@ -8,11 +8,12 @@ import re
 import threading
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
@@ -24,27 +25,32 @@ from config import GPT_MODEL, GREETING_TEXT_PATH, INTERNAL_API_KEY, LIMIT_PER_US
 from config import MANAGER_HANDOFF_POLL_SECONDS, MANAGER_HANDOFF_TIMEOUT_MINUTES
 from config import SUPERADMIN_ID, WAZZUP_CHANNEL_ID, WAZZUP_CHAT_LINK_BASE, WAZZUP_CHAT_TYPE
 from database import add_token_usage, append_dialog_message, cancel_open_operator_handoff
-from database import close_db, close_expired_operator_handoffs, count_media_files
+from database import close_db, close_expired_operator_handoffs, complete_customer_segment_job
+from database import count_media_files
 from database import create_admin, create_operator_handoff
-from database import create_or_update_user, delete_admin, execute_query, get_admin_ids
+from database import create_customer_segment_job, create_or_update_user, delete_admin
+from database import execute_query, fail_customer_segment_job, get_admin_ids
 from database import count_active_superadmins, create_admin_user, delete_admin_user_by_id
-from database import get_admin_user_by_id, get_admin_user_by_username
+from database import get_admin_user_by_id, get_admin_user_by_username, get_customer_segment
 from database import get_analytics_summary, get_handoff_recipient_ids
 from database import get_notification_template_text, get_repair_request_group_stats
 from database import get_media_files, get_operator_handoff_stats, get_recent_dialog
 from database import get_repair_request_stats
 from database import get_token_usage, get_user_conversation, get_users, init_db
 from database import is_bot_paused, list_admin_users, list_customers, list_repair_requests
-from database import list_notification_templates
+from database import list_customer_segments, list_notification_templates
 from database import log_event, mark_message_processed
-from database import record_operator_message, REPAIR_REQUEST_STATUSES, save_feedback
+from database import mark_customer_segment_running, record_operator_message
+from database import REPAIR_REQUEST_STATUSES, save_feedback
 from database import save_media_file, set_bot_paused, set_handoff_recipients
 from database import sync_repair_request_status_by_deal_id
 from database import update_admin_user
 from database import update_notification_templates
 from services.agent import generate_response, transcribe
 from services.admin_auth import hash_password, sign_session, verify_password, verify_session
-from services.integrations import get_bitrix_deal_stage_id, upload_files_to_bitrix
+from services.integrations import build_bitrix_customer_segment, get_bitrix_deal_stage_id
+from services.integrations import list_bitrix_deal_categories, list_bitrix_deal_stages_by_category
+from services.integrations import upload_files_to_bitrix
 from services.media_storage import store_media_bytes
 from services.miscellaneous import format_repair_text_minimal as format_message
 from services.new_conv import new_conversation
@@ -162,6 +168,7 @@ ADMIN_SECTIONS = [
     {"id": "templates", "label": "Шаблоны", "href": "/admin/templates"},
     {"id": "statistics", "label": "Статистика", "href": "/admin/statistics"},
     {"id": "customers", "label": "Клиенты", "href": "/admin/customers"},
+    {"id": "segments", "label": "Сегменты клиентов", "href": "/admin/segments"},
     {"id": "payments", "label": "Платежи", "href": "/admin/payments", "status": "В разработке"},
     {"id": "settings", "label": "Настройки", "href": "/admin/settings"},
     {"id": "users", "label": "Пользователи", "href": "/admin/users"},
@@ -175,6 +182,11 @@ async def parse_urlencoded_form(request: Request) -> dict[str, str]:
     body = (await request.body()).decode("utf-8")
     parsed = parse_qs(body, keep_blank_values=True)
     return {key: values[-1] for key, values in parsed.items()}
+
+
+async def parse_urlencoded_form_multi(request: Request) -> dict[str, list[str]]:
+    body = (await request.body()).decode("utf-8")
+    return parse_qs(body, keep_blank_values=True)
 
 
 async def parse_incoming_post_payload(request: Request) -> dict[str, Any]:
@@ -1650,6 +1662,295 @@ async def admin_customers(request: Request):
         }
     )
     return templates.TemplateResponse("admin_customers.html", context)
+
+
+def parse_segment_stage_values(values: list[str]) -> list[tuple[int, str]]:
+    pairs: list[tuple[int, str]] = []
+    seen: set[tuple[int, str]] = set()
+    for value in values:
+        category_raw, separator, stage_id = value.partition("|")
+        if not separator or not stage_id:
+            continue
+        try:
+            category_id = int(category_raw)
+        except ValueError:
+            continue
+        pair = (category_id, stage_id)
+        if pair not in seen:
+            seen.add(pair)
+            pairs.append(pair)
+    return pairs
+
+
+def segment_stage_value(category_id: int, stage_id: str) -> str:
+    return f"{int(category_id)}|{stage_id}"
+
+
+def default_segment_name() -> str:
+    return f"Сегмент от {datetime.now().strftime('%d.%m.%Y')}"
+
+
+async def fetch_bitrix_segment_categories() -> tuple[list[dict], str | None]:
+    try:
+        return await asyncio.to_thread(list_bitrix_deal_categories), None
+    except Exception as exc:
+        logger.exception("Failed to fetch Bitrix deal categories")
+        return [], f"Не удалось получить воронки Bitrix24: {exc}"
+
+
+async def collect_customer_segment_background(segment_id: int, selections: list[dict]) -> None:
+    await mark_customer_segment_running(segment_id)
+    try:
+        result = await asyncio.to_thread(build_bitrix_customer_segment, selections)
+    except Exception as exc:
+        logger.exception("Failed to collect customer segment %s", segment_id)
+        await fail_customer_segment_job(segment_id, str(exc))
+        return
+
+    await complete_customer_segment_job(segment_id, result)
+    await log_event(
+        None,
+        "customer_segment_completed",
+        json.dumps(
+            {
+                "segment_id": segment_id,
+                "phone_count": result.get("unique_phones"),
+                "contact_count": result.get("unique_contacts"),
+                "deal_count": result.get("total_deals"),
+            },
+            ensure_ascii=False,
+        ),
+    )
+
+
+async def render_admin_segments(
+    request: Request,
+    admin: dict[str, Any],
+    *,
+    step: str = "funnels",
+    categories: list[dict] | None = None,
+    selected_category_ids: list[int] | None = None,
+    stages_by_category: dict[int, list[dict]] | None = None,
+    selected_stage_values: list[str] | None = None,
+    result: dict | None = None,
+    error: str | None = None,
+    segment_name: str | None = None,
+    status_code: int = 200,
+) -> HTMLResponse:
+    if categories is None:
+        categories, fetch_error = await fetch_bitrix_segment_categories()
+        error = error or fetch_error
+    segments = await list_customer_segments()
+
+    context = admin_template_context(request, admin, "segments")
+    context.update(
+        {
+            "step": step,
+            "categories": categories,
+            "selected_category_ids": selected_category_ids or [],
+            "stages_by_category": stages_by_category or {},
+            "selected_stage_values": selected_stage_values or [],
+            "result": result,
+            "error": error,
+            "segments": segments,
+            "segment_name": segment_name or default_segment_name(),
+            "started_segment_id": request.query_params.get("started"),
+            "segment_stage_value": segment_stage_value,
+        }
+    )
+    return templates.TemplateResponse(
+        "admin_segments.html",
+        context,
+        status_code=status_code,
+    )
+
+
+@app.get("/admin/segments", response_class=HTMLResponse)
+async def admin_segments(request: Request):
+    admin = await current_admin(request)
+    if not admin:
+        return admin_login_redirect(request)
+
+    return await render_admin_segments(request, admin)
+
+
+@app.get("/admin/segments/stages", response_class=HTMLResponse)
+async def admin_segments_stages_page(request: Request):
+    admin = await current_admin(request)
+    if not admin:
+        return admin_login_redirect(request)
+
+    return await render_admin_segments(request, admin)
+
+
+@app.post("/admin/segments/stages", response_class=HTMLResponse)
+async def admin_segments_stages(request: Request):
+    admin = await current_admin(request)
+    if not admin:
+        return RedirectResponse("/admin/login", status_code=303)
+
+    form = await parse_urlencoded_form_multi(request)
+    selected_category_ids = sorted({
+        int(value)
+        for value in form.get("category_id", [])
+        if value.strip().isdigit()
+    })
+    if not selected_category_ids:
+        return await render_admin_segments(
+            request,
+            admin,
+            error="Выберите хотя бы одну воронку",
+            status_code=400,
+        )
+
+    categories, category_error = await fetch_bitrix_segment_categories()
+    if category_error:
+        return await render_admin_segments(
+            request,
+            admin,
+            categories=categories,
+            selected_category_ids=selected_category_ids,
+            error=category_error,
+            status_code=502,
+        )
+
+    try:
+        stages_by_category = await asyncio.to_thread(
+            list_bitrix_deal_stages_by_category,
+            selected_category_ids,
+        )
+    except Exception as exc:
+        logger.exception("Failed to fetch Bitrix deal stages")
+        return await render_admin_segments(
+            request,
+            admin,
+            categories=categories,
+            selected_category_ids=selected_category_ids,
+            error=f"Не удалось получить стадии Bitrix24: {exc}",
+            status_code=502,
+        )
+
+    return await render_admin_segments(
+        request,
+        admin,
+        step="stages",
+        categories=categories,
+        selected_category_ids=selected_category_ids,
+        stages_by_category=stages_by_category,
+    )
+
+
+@app.post("/admin/segments/result", response_class=HTMLResponse)
+async def admin_segments_result(request: Request, background_tasks: BackgroundTasks):
+    admin = await current_admin(request)
+    if not admin:
+        return RedirectResponse("/admin/login", status_code=303)
+
+    form = await parse_urlencoded_form_multi(request)
+    stage_pairs = parse_segment_stage_values(form.get("stage", []))
+    segment_name = (form.get("segment_name") or [default_segment_name()])[-1].strip()
+    if not segment_name:
+        segment_name = default_segment_name()
+    segment_name = segment_name[:120]
+    if not stage_pairs:
+        return await render_admin_segments(
+            request,
+            admin,
+            error="Выберите хотя бы одну стадию",
+            segment_name=segment_name,
+            status_code=400,
+        )
+
+    selected_category_ids = sorted({category_id for category_id, _ in stage_pairs})
+    categories, category_error = await fetch_bitrix_segment_categories()
+    if category_error:
+        return await render_admin_segments(
+            request,
+            admin,
+            error=category_error,
+            segment_name=segment_name,
+            status_code=502,
+        )
+
+    try:
+        stages_by_category = await asyncio.to_thread(
+            list_bitrix_deal_stages_by_category,
+            selected_category_ids,
+        )
+    except Exception as exc:
+        logger.exception("Failed to fetch Bitrix deal stages for segment result")
+        return await render_admin_segments(
+            request,
+            admin,
+            categories=categories,
+            selected_category_ids=selected_category_ids,
+            error=f"Не удалось получить стадии Bitrix24: {exc}",
+            segment_name=segment_name,
+            status_code=502,
+        )
+
+    category_names = {int(category["id"]): category["name"] for category in categories}
+    stage_names = {
+        (int(category_id), stage["status_id"]): stage["name"]
+        for category_id, stages in stages_by_category.items()
+        for stage in stages
+    }
+    selected_funnel_names = [
+        category_names.get(category_id, f"Воронка {category_id}")
+        for category_id in selected_category_ids
+    ]
+    if selected_funnel_names:
+        segment_name = f"{segment_name} - {', '.join(selected_funnel_names)}"
+    selections = [
+        {
+            "category_id": category_id,
+            "category_name": category_names.get(category_id, f"Воронка {category_id}"),
+            "stage_id": stage_id,
+            "stage_name": stage_names.get((category_id, stage_id), stage_id),
+        }
+        for category_id, stage_id in stage_pairs
+    ]
+
+    segment_id = await create_customer_segment_job(
+        segment_name,
+        selections,
+        int(admin["id"]) if admin.get("id") else None,
+    )
+    background_tasks.add_task(collect_customer_segment_background, segment_id, selections)
+    await log_event(
+        None,
+        "customer_segment_started",
+        json.dumps(
+            {
+                "segment_id": segment_id,
+                "admin_id": admin.get("id"),
+                "admin_username": admin.get("username"),
+                "selection_count": len(selections),
+            },
+            ensure_ascii=False,
+        ),
+    )
+    return RedirectResponse(f"/admin/segments/stages?started={segment_id}", status_code=303)
+
+
+@app.get("/admin/segments/{segment_id}/download.txt")
+async def admin_segment_download(request: Request, segment_id: int) -> Response:
+    admin = await current_admin(request)
+    if not admin:
+        return admin_login_redirect(request)
+
+    segment = await get_customer_segment(segment_id)
+    if not segment:
+        raise HTTPException(status_code=404, detail="Segment not found")
+    if segment.get("status") != "completed":
+        raise HTTPException(status_code=409, detail="Segment is not completed")
+
+    filename = quote(f"{segment['name']}.txt")
+    return Response(
+        segment.get("phone_text") or "",
+        media_type="text/plain; charset=utf-8",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"},
+    )
 
 
 @app.get("/admin/payments", response_class=HTMLResponse)

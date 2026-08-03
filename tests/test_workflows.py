@@ -1,3 +1,4 @@
+import asyncio
 import os
 import unittest
 from datetime import timedelta
@@ -23,6 +24,7 @@ os.environ.setdefault(
 
 import bot
 import database
+from services import integrations
 from services.wazzup import WazzupClient
 
 
@@ -646,6 +648,120 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('/admin/users/1/delete', html)
         self.assertIn('/admin/users/2/delete', html)
         self.assertEqual(html.count('>Удалить</button>'), 1)
+
+    async def test_bitrix_customer_segment_deduplicates_contacts_and_phones(self):
+        original_webhook_url = integrations.BITRIX_WEBHOOK_URL
+        integrations.BITRIX_WEBHOOK_URL = "https://bitrix.example/rest/1/token/"
+
+        def response(payload: dict) -> Mock:
+            mocked_response = Mock()
+            mocked_response.raise_for_status = Mock()
+            mocked_response.json.return_value = payload
+            return mocked_response
+
+        def fake_post(url: str, json: dict, timeout: int = 30):
+            method = url.rstrip("/").split("/")[-1]
+            if method == "crm.item.list" and json["start"] == 0:
+                return response({
+                    "result": {
+                        "items": [
+                            {"contactIds": [301]},
+                            {"contactIds": [301]},
+                        ],
+                        "total": 4,
+                    },
+                    "next": 50,
+                })
+            if method == "crm.item.list" and json["start"] == 50:
+                return response({
+                    "result": {
+                        "items": [
+                            {"contactIds": [302, 303]},
+                        ],
+                        "total": 4,
+                    },
+                })
+            if method == "crm.item.get" and json["id"] == 301:
+                return response({
+                    "result": {
+                        "item": {
+                            "id": 301,
+                            "phone": "+7 (707) 554-44-92",
+                        }
+                    }
+                })
+            if method == "crm.item.get" and json["id"] == 302:
+                return response({
+                    "result": {
+                        "item": {
+                            "id": 302,
+                            "fm": [
+                                {
+                                    "typeId": "PHONE",
+                                    "value": "8 701 000 00 00",
+                                }
+                            ],
+                        }
+                    }
+                })
+            if method == "crm.item.get" and json["id"] == 303:
+                return response({
+                    "result": {
+                        "item": {
+                            "id": 303,
+                            "phone": "+1 555 000 0000",
+                        }
+                    }
+                })
+            raise AssertionError(f"Unexpected Bitrix call: {method} {json}")
+
+        try:
+            with unittest.mock.patch.object(integrations.requests, "post", side_effect=fake_post):
+                result = await asyncio.to_thread(
+                    integrations.build_bitrix_customer_segment,
+                    [
+                        {
+                            "category_id": 5,
+                            "category_name": "Online Deals",
+                            "stage_id": "C5:WON",
+                            "stage_name": "WON",
+                        }
+                    ],
+                )
+        finally:
+            integrations.BITRIX_WEBHOOK_URL = original_webhook_url
+
+        self.assertEqual(result["total_deals"], 4)
+        self.assertEqual(result["unique_contacts"], 3)
+        self.assertEqual(result["phones"], ["77010000000", "77075544492"])
+        self.assertEqual(result["stage_rows"][0]["contact_count"], 3)
+
+    async def test_customer_segment_history_persists_completed_phone_list(self):
+        segment_id = await database.create_customer_segment_job(
+            "Сегмент от 30.07.2026",
+            [{"category_id": 5, "stage_id": "C5:WON"}],
+            1,
+        )
+
+        await database.mark_customer_segment_running(segment_id)
+        await database.complete_customer_segment_job(
+            segment_id,
+            {
+                "stage_rows": [{"stage_id": "C5:WON"}],
+                "phone_text": "77010000000\n77075544492",
+                "unique_phones": 2,
+                "unique_contacts": 3,
+                "total_deals": 4,
+            },
+        )
+
+        segment = await database.get_customer_segment(segment_id)
+        segments = await database.list_customer_segments()
+
+        self.assertEqual(segment["status"], "completed")
+        self.assertEqual(segment["phone_count"], 2)
+        self.assertTrue(segment["can_download"])
+        self.assertEqual(segments[0]["id"], segment_id)
 
     async def test_handoff_settings_show_only_recipient_names(self):
         html = bot.templates.env.get_template("admin_settings.html").render(

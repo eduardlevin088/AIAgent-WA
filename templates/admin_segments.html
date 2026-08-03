@@ -1,0 +1,473 @@
+{% extends "admin_base.html" %}
+
+{% block title %}Сегменты клиентов{% endblock %}
+
+{% block head %}
+<style>
+    .segments-layout {
+        display: grid;
+        gap: 16px;
+    }
+
+    .segment-panel {
+        padding: 18px;
+    }
+
+    .step-list {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 12px;
+        margin-bottom: 18px;
+    }
+
+    .step-item {
+        position: relative;
+        min-height: 72px;
+        padding: 14px 16px 14px 52px;
+        color: var(--muted);
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+    }
+
+    .step-item.is-active {
+        color: var(--accent);
+        background: rgba(15, 111, 104, 0.08);
+        border-color: rgba(15, 111, 104, 0.22);
+    }
+
+    .step-item strong {
+        display: block;
+        margin-bottom: 4px;
+        color: inherit;
+    }
+
+    .step-number {
+        position: absolute;
+        left: 14px;
+        top: 14px;
+        display: grid;
+        place-items: center;
+        width: 26px;
+        height: 26px;
+        color: var(--accent-ink);
+        background: var(--accent);
+        border-radius: 999px;
+        font-size: 13px;
+        font-weight: 800;
+    }
+
+    .choice-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+        gap: 10px;
+        margin: 0 0 16px;
+        padding: 0;
+        list-style: none;
+    }
+
+    .choice-card {
+        display: flex;
+        align-items: flex-start;
+        gap: 10px;
+        min-height: 58px;
+        padding: 12px;
+        background: var(--surface-strong);
+        border: 1px solid var(--line);
+        border-radius: 7px;
+    }
+
+    .choice-card input {
+        width: 18px;
+        min-height: 18px;
+        margin-top: 1px;
+        flex: 0 0 auto;
+    }
+
+    .choice-title {
+        display: block;
+        font-weight: 700;
+        line-height: 1.25;
+        overflow-wrap: anywhere;
+    }
+
+    .choice-meta {
+        display: block;
+        margin-top: 3px;
+        color: var(--muted);
+        font-size: 13px;
+    }
+
+    .stage-group {
+        margin-bottom: 14px;
+        padding: 14px;
+        background: var(--surface-strong);
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+    }
+
+    .stage-group h2 {
+        margin: 0 0 12px;
+        font-size: 18px;
+    }
+
+    .actions-row {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        flex-wrap: wrap;
+    }
+
+    .segment-submit {
+        display: grid;
+        grid-template-columns: minmax(220px, 360px) auto auto;
+        gap: 10px;
+        align-items: end;
+    }
+
+    .field-label {
+        display: grid;
+        gap: 6px;
+        color: var(--muted);
+        font-size: 13px;
+        font-weight: 650;
+    }
+
+    .result-grid {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 360px;
+        gap: 16px;
+        align-items: start;
+    }
+
+    .summary-grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 10px;
+        margin-bottom: 14px;
+    }
+
+    .summary-card {
+        padding: 13px;
+        background: var(--surface-strong);
+        border: 1px solid var(--line);
+        border-radius: 7px;
+    }
+
+    .summary-card strong {
+        display: block;
+        margin-top: 4px;
+        font-size: 22px;
+        line-height: 1;
+    }
+
+    .result-table {
+        width: 100%;
+        border-collapse: collapse;
+        overflow: hidden;
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+    }
+
+    .result-table th,
+    .result-table td {
+        padding: 10px;
+        text-align: left;
+        border-bottom: 1px solid var(--line);
+        vertical-align: top;
+    }
+
+    .result-table th {
+        color: var(--muted);
+        background: #eee9dd;
+        font-size: 13px;
+        font-weight: 750;
+    }
+
+    .result-table tr:last-child td {
+        border-bottom: 0;
+    }
+
+    .segment-name-cell {
+        min-width: 240px;
+        white-space: normal;
+        overflow-wrap: anywhere;
+        word-break: normal;
+    }
+
+    .phone-output {
+        width: 100%;
+        min-height: 420px;
+        padding: 12px;
+        color: var(--ink);
+        background: var(--surface-strong);
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        font: 14px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        resize: vertical;
+    }
+
+    .empty-note {
+        padding: 14px;
+        color: var(--muted);
+        background: var(--surface-strong);
+        border: 1px dashed var(--line);
+        border-radius: var(--radius);
+    }
+
+    .success-note {
+        padding: 12px;
+        color: #13543d;
+        background: #dcf5e8;
+        border: 1px solid #abd8bf;
+        border-radius: 7px;
+        margin-bottom: 16px;
+    }
+
+    .status-pill {
+        display: inline-flex;
+        align-items: center;
+        min-height: 24px;
+        padding: 0 9px;
+        border-radius: 999px;
+        font-size: 12px;
+        font-weight: 750;
+        white-space: nowrap;
+    }
+
+    .status-pending,
+    .status-running {
+        color: var(--warning);
+        background: rgba(173, 95, 0, 0.1);
+        border: 1px solid rgba(173, 95, 0, 0.18);
+    }
+
+    .status-completed {
+        color: #13543d;
+        background: #dcf5e8;
+        border: 1px solid #abd8bf;
+    }
+
+    .status-failed {
+        color: var(--danger);
+        background: #f8dddd;
+        border: 1px solid #efbcbc;
+    }
+
+    .history-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 12px;
+    }
+
+    .history-header h2 {
+        margin: 0;
+        font-size: 22px;
+    }
+
+    .hidden-copy-source {
+        position: absolute;
+        left: -9999px;
+        width: 1px;
+        height: 1px;
+        opacity: 0;
+    }
+
+    @media (max-width: 900px) {
+        .step-list,
+        .summary-grid,
+        .result-grid,
+        .segment-submit {
+            grid-template-columns: 1fr;
+        }
+    }
+</style>
+{% endblock %}
+
+{% block body %}
+<div class="shell">
+    {% include "_admin_topbar.html" %}
+
+    <main class="page">
+        <section class="page-heading" aria-labelledby="segments-title">
+            <div>
+                <h1 id="segments-title">Сегменты клиентов</h1>
+                <p>Соберите список телефонов из Bitrix24 по выбранным воронкам и стадиям. Готовый список можно вставить в Bitrix24 Рассылка для WABA-кампании.</p>
+            </div>
+        </section>
+
+        <section class="step-list" aria-label="Шаги">
+            <div class="step-item {% if step == 'funnels' %}is-active{% endif %}">
+                <span class="step-number">1</span>
+                <strong>Воронки</strong>
+                Выбор направлений сделок
+            </div>
+            <div class="step-item {% if step == 'stages' %}is-active{% endif %}">
+                <span class="step-number">2</span>
+                <strong>Стадии</strong>
+                Фильтр по этапам CRM
+            </div>
+        </section>
+
+        {% if error %}
+            <div class="error" style="margin-bottom: 16px;">{{ error }}</div>
+        {% endif %}
+        {% if started_segment_id %}
+            <div class="success-note">Сегмент #{{ started_segment_id }} поставлен в очередь. Страница обновится автоматически, пока идёт сбор.</div>
+        {% endif %}
+
+        {% if step == 'funnels' %}
+            <form class="panel segment-panel" method="post" action="/admin/segments/stages">
+                {% if categories %}
+                    <ul class="choice-grid">
+                        {% for category in categories %}
+                            <li>
+                                <label class="choice-card">
+                                    <input type="checkbox" name="category_id" value="{{ category.id }}" {% if category.id in selected_category_ids %}checked{% endif %}>
+                                    <span>
+                                        <span class="choice-title">{{ category.name }}</span>
+                                    </span>
+                                </label>
+                            </li>
+                        {% endfor %}
+                    </ul>
+                    <div class="actions-row">
+                        <button type="submit">Показать стадии</button>
+                    </div>
+                {% else %}
+                    <p class="empty-note">Воронки не загружены. Проверьте доступы Bitrix24 и попробуйте обновить страницу.</p>
+                {% endif %}
+            </form>
+        {% elif step == 'stages' %}
+            <form class="segments-layout" method="post" action="/admin/segments/result">
+                {% for category in categories %}
+                    {% if category.id in selected_category_ids %}
+                        <section class="stage-group">
+                            <h2>{{ category.name }}</h2>
+                            {% set stages = stages_by_category.get(category.id, []) %}
+                            {% if stages %}
+                                <ul class="choice-grid">
+                                    {% for stage in stages %}
+                                        {% set value = segment_stage_value(category.id, stage.status_id) %}
+                                        <li>
+                                            <label class="choice-card">
+                                                <input type="checkbox" name="stage" value="{{ value }}" {% if value in selected_stage_values %}checked{% endif %}>
+                                                <span>
+                                                    <span class="choice-title">{{ stage.name }}</span>
+                                                    <span class="choice-meta">{{ stage.status_id }}</span>
+                                                </span>
+                                            </label>
+                                        </li>
+                                    {% endfor %}
+                                </ul>
+                            {% else %}
+                                <p class="empty-note">В этой воронке нет доступных стадий.</p>
+                            {% endif %}
+                        </section>
+                    {% endif %}
+                {% endfor %}
+                <div class="segment-submit">
+                    <label class="field-label">
+                        Название сегмента
+                        <input type="text" name="segment_name" value="{{ segment_name }}" maxlength="120" required>
+                    </label>
+                    <button type="submit">Собрать сегмент</button>
+                    <a class="button secondary" href="/admin/segments">Назад к воронкам</a>
+                </div>
+            </form>
+        {% endif %}
+
+        <section class="panel segment-panel" style="margin-top: 16px;">
+            <div class="history-header">
+                <h2>История сегментов</h2>
+                <a class="button secondary" href="/admin/segments/stages">Обновить</a>
+            </div>
+
+            {% if segments %}
+                <table class="result-table">
+                    <thead>
+                        <tr>
+                            <th>Название</th>
+                            <th>Статус</th>
+                            <th>Телефоны</th>
+                            <th>Сделки</th>
+                            <th>Создан</th>
+                            <th>Действия</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for segment in segments %}
+                            <tr {% if segment.status in ['pending', 'running'] %}data-segment-running="1"{% endif %}>
+                                <td class="segment-name-cell">
+                                    <strong>{{ segment.name }}</strong>
+                                    {% if segment.error %}
+                                        <div class="muted">{{ segment.error }}</div>
+                                    {% endif %}
+                                </td>
+                                <td>
+                                    <span class="status-pill status-{{ segment.status }}">
+                                        {% if segment.status == 'completed' %}
+                                            Готов
+                                        {% elif segment.status == 'running' %}
+                                            Собирается
+                                        {% elif segment.status == 'failed' %}
+                                            Ошибка
+                                        {% else %}
+                                            В очереди
+                                        {% endif %}
+                                    </span>
+                                </td>
+                                <td>{{ segment.phone_count }}</td>
+                                <td>{{ segment.deal_count }}</td>
+                                <td>{{ segment.created_at }}</td>
+                                <td>
+                                    {% if segment.can_download %}
+                                        <div class="actions-row">
+                                            <a class="button secondary" href="/admin/segments/{{ segment.id }}/download.txt">Скачать</a>
+                                            <button class="secondary copy-segment" type="button" data-copy-target="segment-phones-{{ segment.id }}">Копировать</button>
+                                        </div>
+                                        <textarea id="segment-phones-{{ segment.id }}" class="hidden-copy-source" readonly>{{ segment.phone_text }}</textarea>
+                                    {% else %}
+                                        <span class="muted">Недоступно</span>
+                                    {% endif %}
+                                </td>
+                            </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            {% else %}
+                <p class="empty-note">Пока нет собранных сегментов.</p>
+            {% endif %}
+        </section>
+    </main>
+</div>
+<script>
+    document.querySelectorAll(".copy-segment").forEach((button) => {
+        button.addEventListener("click", async () => {
+            const target = document.getElementById(button.dataset.copyTarget);
+            if (!target) return;
+            const text = target.value;
+            try {
+                await navigator.clipboard.writeText(text);
+            } catch (error) {
+                target.focus();
+                target.select();
+                document.execCommand("copy");
+            }
+            const original = button.textContent;
+            button.textContent = "Скопировано";
+            window.setTimeout(() => {
+                button.textContent = original;
+            }, 1400);
+        });
+    });
+
+    if (document.querySelector("[data-segment-running]")) {
+        window.setTimeout(() => {
+            window.location.reload();
+        }, 5000);
+    }
+</script>
+{% endblock %}

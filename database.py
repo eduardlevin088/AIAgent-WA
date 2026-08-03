@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Sequence
@@ -298,6 +299,47 @@ async def create_tables():
         "furthest_bitrix_stage_rank",
         "furthest_bitrix_stage_rank INTEGER",
     )
+
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS customer_segments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            selections_json TEXT NOT NULL,
+            stage_rows_json TEXT,
+            phone_text TEXT,
+            phone_count INTEGER NOT NULL DEFAULT 0,
+            contact_count INTEGER NOT NULL DEFAULT 0,
+            deal_count INTEGER NOT NULL DEFAULT 0,
+            error TEXT,
+            created_by INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            started_at TIMESTAMP,
+            completed_at TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    await ensure_column("customer_segments", "name", "name TEXT NOT NULL DEFAULT 'Сегмент'")
+    await ensure_column("customer_segments", "status", "status TEXT NOT NULL DEFAULT 'pending'")
+    await ensure_column("customer_segments", "selections_json", "selections_json TEXT NOT NULL DEFAULT '[]'")
+    await ensure_column("customer_segments", "stage_rows_json", "stage_rows_json TEXT")
+    await ensure_column("customer_segments", "phone_text", "phone_text TEXT")
+    await ensure_column("customer_segments", "phone_count", "phone_count INTEGER NOT NULL DEFAULT 0")
+    await ensure_column("customer_segments", "contact_count", "contact_count INTEGER NOT NULL DEFAULT 0")
+    await ensure_column("customer_segments", "deal_count", "deal_count INTEGER NOT NULL DEFAULT 0")
+    await ensure_column("customer_segments", "error", "error TEXT")
+    await ensure_column("customer_segments", "created_by", "created_by INTEGER")
+    await ensure_column("customer_segments", "started_at", "started_at TIMESTAMP")
+    await ensure_column("customer_segments", "completed_at", "completed_at TIMESTAMP")
+    await ensure_column(
+        "customer_segments",
+        "updated_at",
+        "updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+    )
+    await db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_customer_segments_created_at
+        ON customer_segments (created_at DESC)
+    """)
     
     logger.info("Database tables created successfully")
 
@@ -1517,6 +1559,132 @@ async def update_notification_templates(template_texts: dict[str, str]) -> None:
         for stage_id, text in template_texts.items()
     ])
     await db.commit()
+
+
+async def create_customer_segment_job(
+    name: str,
+    selections: list[dict],
+    created_by: int | None,
+) -> int:
+    if db is None:
+        raise RuntimeError("Database not initialized")
+
+    cursor = await db.execute("""
+        INSERT INTO customer_segments (
+            name, status, selections_json, created_by
+        )
+        VALUES (?, 'pending', ?, ?)
+    """, (
+        name,
+        json.dumps(selections, ensure_ascii=False),
+        created_by,
+    ))
+    await db.commit()
+    return int(cursor.lastrowid)
+
+
+async def mark_customer_segment_running(segment_id: int) -> None:
+    if db is None:
+        raise RuntimeError("Database not initialized")
+
+    await db.execute("""
+        UPDATE customer_segments
+        SET status = 'running',
+            started_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP,
+            error = NULL
+        WHERE id = ?
+    """, (segment_id,))
+    await db.commit()
+
+
+async def complete_customer_segment_job(segment_id: int, result: dict) -> None:
+    if db is None:
+        raise RuntimeError("Database not initialized")
+
+    await db.execute("""
+        UPDATE customer_segments
+        SET status = 'completed',
+            stage_rows_json = ?,
+            phone_text = ?,
+            phone_count = ?,
+            contact_count = ?,
+            deal_count = ?,
+            error = NULL,
+            completed_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+    """, (
+        json.dumps(result.get("stage_rows") or [], ensure_ascii=False),
+        result.get("phone_text") or "",
+        int(result.get("unique_phones") or 0),
+        int(result.get("unique_contacts") or 0),
+        int(result.get("total_deals") or 0),
+        segment_id,
+    ))
+    await db.commit()
+
+
+async def fail_customer_segment_job(segment_id: int, error: str) -> None:
+    if db is None:
+        raise RuntimeError("Database not initialized")
+
+    await db.execute("""
+        UPDATE customer_segments
+        SET status = 'failed',
+            error = ?,
+            completed_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+    """, (error[:2000], segment_id))
+    await db.commit()
+
+
+def _segment_row_to_dict(row) -> dict:
+    item = dict(row)
+    try:
+        item["selections"] = json.loads(item.get("selections_json") or "[]")
+    except json.JSONDecodeError:
+        item["selections"] = []
+    try:
+        item["stage_rows"] = json.loads(item.get("stage_rows_json") or "[]")
+    except json.JSONDecodeError:
+        item["stage_rows"] = []
+    item["can_download"] = item.get("status") == "completed" and bool(item.get("phone_text"))
+    return item
+
+
+async def list_customer_segments(limit: int = 20) -> list[dict]:
+    if db is None:
+        raise RuntimeError("Database not initialized")
+
+    async with db.execute("""
+        SELECT
+            id, name, status, selections_json, stage_rows_json, phone_text,
+            phone_count, contact_count, deal_count, error, created_by,
+            created_at, started_at, completed_at, updated_at
+        FROM customer_segments
+        ORDER BY datetime(created_at) DESC, id DESC
+        LIMIT ?
+    """, (limit,)) as cursor:
+        rows = await cursor.fetchall()
+    return [_segment_row_to_dict(row) for row in rows]
+
+
+async def get_customer_segment(segment_id: int) -> dict | None:
+    if db is None:
+        raise RuntimeError("Database not initialized")
+
+    async with db.execute("""
+        SELECT
+            id, name, status, selections_json, stage_rows_json, phone_text,
+            phone_count, contact_count, deal_count, error, created_by,
+            created_at, started_at, completed_at, updated_at
+        FROM customer_segments
+        WHERE id = ?
+    """, (segment_id,)) as cursor:
+        row = await cursor.fetchone()
+    return _segment_row_to_dict(row) if row else None
 
 
 async def update_repair_request_status_by_deal_id(deal_id: int, status: str) -> int:
