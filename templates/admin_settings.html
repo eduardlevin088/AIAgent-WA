@@ -96,6 +96,16 @@
 {% block body %}
 <div class="shell">
     {% include "_admin_topbar.html" %}
+    {% set working_hours_value = working_hours | default({'enabled': True, 'start': '10:00', 'end': '19:00', 'days': [0,1,2,3,4]}) %}
+    {% set working_days_value = working_days | default([
+        {'value': 0, 'label': 'Пн'},
+        {'value': 1, 'label': 'Вт'},
+        {'value': 2, 'label': 'Ср'},
+        {'value': 3, 'label': 'Чт'},
+        {'value': 4, 'label': 'Пт'},
+        {'value': 5, 'label': 'Сб'},
+        {'value': 6, 'label': 'Вс'},
+    ]) %}
 
     <main class="page">
         <section class="page-heading" aria-labelledby="settings-title">
@@ -140,7 +150,7 @@
                     <p class="field-help">Если выключено — эскалация на менеджера доступна круглосуточно.</p>
                     <label class="recipient-field">
                         <span>
-                            <input type="checkbox" name="working_hours_enabled" value="1" {% if working_hours.enabled %}checked{% endif %}>
+                            <input type="checkbox" name="working_hours_enabled" value="1" {% if working_hours_value.enabled %}checked{% endif %}>
                             Ограничить по времени
                         </span>
                     </label>
@@ -148,19 +158,19 @@
                         <div class="time-grid">
                             <label class="recipient-field">
                                 <span>Начало</span>
-                                <input type="time" name="working_hours_start" value="{{ working_hours.start }}">
+                                <input type="time" name="working_hours_start" value="{{ working_hours_value.start }}">
                             </label>
                             <label class="recipient-field">
                                 <span>Окончание</span>
-                                <input type="time" name="working_hours_end" value="{{ working_hours.end }}">
+                                <input type="time" name="working_hours_end" value="{{ working_hours_value.end }}">
                             </label>
                         </div>
                         <div>
                             <p class="field-help">Рабочие дни</p>
                             <div class="checkbox-row">
-                                {% for day in working_days %}
+                                {% for day in working_days_value %}
                                     <label class="day-checkbox">
-                                        <input type="checkbox" name="working_days" value="{{ day.value }}" {% if day.value in working_hours.days %}checked{% endif %}>
+                                        <input type="checkbox" name="working_days" value="{{ day.value }}" {% if day.value in working_hours_value.days %}checked{% endif %}>
                                         {{ day.label }}
                                     </label>
                                 {% endfor %}
