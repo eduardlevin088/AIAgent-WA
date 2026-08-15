@@ -1,9 +1,13 @@
 import re
+import time
+import logging
+from typing import Any
 
 import requests
 from config import BITRIX_BOT_STAGE_ID, BITRIX_DEAL_ENTITY_TYPE_ID, BITRIX_SERVICE_CATEGORY_ID
 from config import BITRIX_WEBHOOK_URL
 
+logger = logging.getLogger(__name__)
 
 PHONE_SEGMENT_PATTERN = re.compile(r"^77\d{9}$")
 
@@ -14,13 +18,53 @@ def bitrix_method_url(method: str) -> str:
     return f"{BITRIX_WEBHOOK_URL.rstrip('/')}/{method}"
 
 
-def call_bitrix_method(method: str, payload: dict, timeout: int = 30) -> dict:
-    response = requests.post(bitrix_method_url(method), json=payload, timeout=timeout)
-    response.raise_for_status()
-    data = response.json()
-    if data.get("error"):
-        raise RuntimeError(data.get("error_description") or data.get("error"))
-    return data
+def call_bitrix_method(
+    method: str,
+    payload: dict,
+    timeout: int = 30,
+    max_retries: int = 3,
+) -> dict:
+    last_error: Exception | None = None
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(bitrix_method_url(method), json=payload, timeout=timeout)
+            response.raise_for_status()
+            data = response.json()
+            if data.get("error"):
+                raise RuntimeError(data.get("error_description") or data.get("error"))
+            return data
+        except requests.HTTPError as exc:
+            last_error = exc
+            if response.status_code >= 500 and attempt < max_retries - 1:
+                logger.warning(
+                    "Bitrix temporary error, retrying %s (%s/%s), status=%s",
+                    method,
+                    attempt + 1,
+                    max_retries,
+                    response.status_code,
+                )
+                time.sleep(0.5 * (2 ** attempt))
+                continue
+            raise
+        except requests.RequestException as exc:
+            last_error = exc
+            if attempt < max_retries - 1:
+                logger.warning(
+                    "Bitrix request failed, retrying %s (%s/%s): %s",
+                    method,
+                    attempt + 1,
+                    max_retries,
+                    exc,
+                )
+                time.sleep(0.5 * (2 ** attempt))
+                continue
+            raise
+        except ValueError as exc:
+            last_error = exc
+            raise RuntimeError("Bitrix returned non-JSON response") from exc
+
+    assert last_error is not None
+    raise RuntimeError(f"Bitrix method {method} failed: {last_error}")
 
 
 def list_bitrix_deal_categories() -> list[dict]:
@@ -170,9 +214,13 @@ def get_bitrix_contact_phones(contact_id: int) -> list[str]:
     return _extract_contact_phones(item)
 
 
-def build_bitrix_customer_segment(selections: list[dict]) -> dict:
+def build_bitrix_customer_segment(
+    selections: list[dict],
+    max_phone_count: int | None = None,
+) -> dict:
     stage_rows: list[dict] = []
     all_contact_ids: set[int] = set()
+    failed_contacts: list[int] = []
 
     for selection in selections:
         category_id = int(selection["category_id"])
@@ -194,7 +242,16 @@ def build_bitrix_customer_segment(selections: list[dict]) -> dict:
     phones_by_contact: list[dict] = []
     unique_phones: set[str] = set()
     for contact_id in sorted(all_contact_ids):
-        phones = get_bitrix_contact_phones(contact_id)
+        try:
+            phones = get_bitrix_contact_phones(contact_id)
+        except Exception as exc:
+            failed_contacts.append(contact_id)
+            logger.warning(
+                "Failed to collect phones for contact %s: %s",
+                contact_id,
+                exc,
+            )
+            continue
         unique_phones.update(phones)
         phones_by_contact.append(
             {
@@ -204,6 +261,22 @@ def build_bitrix_customer_segment(selections: list[dict]) -> dict:
         )
 
     phones = sorted(unique_phones)
+    if max_phone_count and max_phone_count > 0:
+        phones = phones[:max_phone_count]
+        # Keep consistent contact metadata with truncated phones for the final list.
+        truncated_phones_by_contact = []
+        limit_set = set(phones)
+        for row in phones_by_contact:
+            filtered = [phone for phone in row["phones"] if phone in limit_set]
+            if not filtered:
+                continue
+            truncated_phones_by_contact.append(
+                {
+                    "contact_id": row["contact_id"],
+                    "phones": filtered,
+                }
+            )
+        phones_by_contact = truncated_phones_by_contact
     return {
         "stage_rows": stage_rows,
         "phones_by_contact": phones_by_contact,
@@ -211,7 +284,10 @@ def build_bitrix_customer_segment(selections: list[dict]) -> dict:
         "phone_text": "\n".join(phones),
         "total_deals": sum(row["deal_count"] for row in stage_rows),
         "unique_contacts": len(all_contact_ids),
+        "requested_phone_count_limit": max_phone_count or 0,
+        "collected_contacts": len(phones_by_contact),
         "unique_phones": len(phones),
+        "failed_contacts": failed_contacts,
     }
 
 

@@ -7,6 +7,8 @@ from typing import Optional, Sequence
 import aiosqlite
 
 from config import BITRIX_BOT_STAGE_ID, BITRIX_STAGE_RANKS, DB_PATH
+from config import MANAGER_WORKING_DAYS, MANAGER_WORKING_HOURS_ENABLED
+from config import MANAGER_WORKING_HOURS_END, MANAGER_WORKING_HOURS_START
 from prettytable import PrettyTable
 
 
@@ -188,6 +190,35 @@ async def create_tables():
     """)
 
     await db.execute("""
+        CREATE TABLE IF NOT EXISTS app_settings (
+            setting_key TEXT PRIMARY KEY,
+            setting_value TEXT NOT NULL
+        )
+    """)
+    await db.executemany("""
+        INSERT INTO app_settings (setting_key, setting_value)
+        VALUES (?, ?)
+        ON CONFLICT(setting_key) DO NOTHING
+    """, [
+        (
+            "MANAGER_WORKING_HOURS_ENABLED",
+            "1" if MANAGER_WORKING_HOURS_ENABLED else "0",
+        ),
+        (
+            "MANAGER_WORKING_HOURS_START",
+            MANAGER_WORKING_HOURS_START,
+        ),
+        (
+            "MANAGER_WORKING_HOURS_END",
+            MANAGER_WORKING_HOURS_END,
+        ),
+        (
+            "MANAGER_WORKING_DAYS",
+            ",".join(str(day) for day in sorted(MANAGER_WORKING_DAYS)),
+        ),
+    ])
+
+    await db.execute("""
         CREATE TABLE IF NOT EXISTS dialog_messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id TEXT,
@@ -311,6 +342,7 @@ async def create_tables():
             phone_count INTEGER NOT NULL DEFAULT 0,
             contact_count INTEGER NOT NULL DEFAULT 0,
             deal_count INTEGER NOT NULL DEFAULT 0,
+            max_phone_count INTEGER NOT NULL DEFAULT 0,
             error TEXT,
             created_by INTEGER,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -327,6 +359,11 @@ async def create_tables():
     await ensure_column("customer_segments", "phone_count", "phone_count INTEGER NOT NULL DEFAULT 0")
     await ensure_column("customer_segments", "contact_count", "contact_count INTEGER NOT NULL DEFAULT 0")
     await ensure_column("customer_segments", "deal_count", "deal_count INTEGER NOT NULL DEFAULT 0")
+    await ensure_column(
+        "customer_segments",
+        "max_phone_count",
+        "max_phone_count INTEGER NOT NULL DEFAULT 0",
+    )
     await ensure_column("customer_segments", "error", "error TEXT")
     await ensure_column("customer_segments", "created_by", "created_by INTEGER")
     await ensure_column("customer_segments", "started_at", "started_at TIMESTAMP")
@@ -449,7 +486,86 @@ async def get_admin_ids() -> list[str]:
         "SELECT user_id FROM admin"
     ) as cursor:
         rows = await cursor.fetchall()
-        return [row["user_id"] for row in rows]
+    return [row["user_id"] for row in rows]
+
+
+async def get_app_setting(key: str, default: str | None = None) -> str | None:
+    if db is None:
+        raise RuntimeError("Database not initialized")
+
+    async with db.execute("""
+        SELECT setting_value
+        FROM app_settings
+        WHERE setting_key = ?
+    """, (key,)) as cursor:
+        row = await cursor.fetchone()
+    if row:
+        return row["setting_value"]
+    return default
+
+
+async def set_app_setting(key: str, value: str) -> None:
+    if db is None:
+        raise RuntimeError("Database not initialized")
+
+    await db.execute("""
+        INSERT INTO app_settings (setting_key, setting_value)
+        VALUES (?, ?)
+        ON CONFLICT(setting_key) DO UPDATE SET
+            setting_value = excluded.setting_value
+    """, (key, value))
+    await db.commit()
+
+
+async def get_manager_working_hours_settings() -> dict[str, str | bool | list[int]]:
+    if db is None:
+        raise RuntimeError("Database not initialized")
+
+    enabled = await get_app_setting(
+        "MANAGER_WORKING_HOURS_ENABLED",
+        "1" if MANAGER_WORKING_HOURS_ENABLED else "0",
+    )
+    start = await get_app_setting("MANAGER_WORKING_HOURS_START", MANAGER_WORKING_HOURS_START)
+    end = await get_app_setting("MANAGER_WORKING_HOURS_END", MANAGER_WORKING_HOURS_END)
+    days_raw = await get_app_setting(
+        "MANAGER_WORKING_DAYS",
+        ",".join(str(day) for day in sorted(MANAGER_WORKING_DAYS)),
+    )
+
+    try:
+        working_days = [
+            int(item)
+            for item in (days_raw or "").split(",")
+            if item.strip().isdigit() and 0 <= int(item.strip()) <= 6
+        ]
+    except Exception:
+        working_days = sorted(MANAGER_WORKING_DAYS)
+
+    return {
+        "enabled": str(enabled).lower() in {"1", "true", "yes", "on"},
+        "start": (start or MANAGER_WORKING_HOURS_START),
+        "end": (end or MANAGER_WORKING_HOURS_END),
+        "days": sorted(set(working_days)),
+    }
+
+
+async def set_manager_working_hours_settings(
+    *,
+    enabled: bool,
+    start: str,
+    end: str,
+    working_days: list[int],
+) -> None:
+    if db is None:
+        raise RuntimeError("Database not initialized")
+
+    await set_app_setting("MANAGER_WORKING_HOURS_ENABLED", "1" if enabled else "0")
+    await set_app_setting("MANAGER_WORKING_HOURS_START", start)
+    await set_app_setting("MANAGER_WORKING_HOURS_END", end)
+    await set_app_setting(
+        "MANAGER_WORKING_DAYS",
+        ",".join(str(day) for day in sorted(set(working_days))),
+    )
 
 
 async def upsert_admin_user(username: str, password_hash: str, role: str = "superadmin") -> None:
@@ -1564,6 +1680,7 @@ async def update_notification_templates(template_texts: dict[str, str]) -> None:
 async def create_customer_segment_job(
     name: str,
     selections: list[dict],
+    max_phone_count: int | None,
     created_by: int | None,
 ) -> int:
     if db is None:
@@ -1571,12 +1688,13 @@ async def create_customer_segment_job(
 
     cursor = await db.execute("""
         INSERT INTO customer_segments (
-            name, status, selections_json, created_by
+            name, status, selections_json, max_phone_count, created_by
         )
-        VALUES (?, 'pending', ?, ?)
+        VALUES (?, 'pending', ?, ?, ?)
     """, (
         name,
         json.dumps(selections, ensure_ascii=False),
+        int(max_phone_count or 0),
         created_by,
     ))
     await db.commit()
@@ -1610,6 +1728,7 @@ async def complete_customer_segment_job(segment_id: int, result: dict) -> None:
             phone_count = ?,
             contact_count = ?,
             deal_count = ?,
+            max_phone_count = COALESCE(max_phone_count, 0),
             error = NULL,
             completed_at = CURRENT_TIMESTAMP,
             updated_at = CURRENT_TIMESTAMP
@@ -1662,6 +1781,7 @@ async def list_customer_segments(limit: int = 20) -> list[dict]:
         SELECT
             id, name, status, selections_json, stage_rows_json, phone_text,
             phone_count, contact_count, deal_count, error, created_by,
+            max_phone_count,
             created_at, started_at, completed_at, updated_at
         FROM customer_segments
         ORDER BY datetime(created_at) DESC, id DESC
@@ -1679,6 +1799,7 @@ async def get_customer_segment(segment_id: int) -> dict | None:
         SELECT
             id, name, status, selections_json, stage_rows_json, phone_text,
             phone_count, contact_count, deal_count, error, created_by,
+            max_phone_count,
             created_at, started_at, completed_at, updated_at
         FROM customer_segments
         WHERE id = ?

@@ -46,6 +46,47 @@
         font-weight: 700;
     }
 
+    .section-stack {
+        display: grid;
+        gap: 16px;
+    }
+
+    .working-hours-grid {
+        display: grid;
+        gap: 14px;
+        max-width: 520px;
+        margin-bottom: 18px;
+    }
+
+    .time-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(180px, 1fr));
+        gap: 12px;
+    }
+
+    .checkbox-row {
+        display: grid;
+        grid-template-columns: repeat(7, minmax(44px, 1fr));
+        gap: 8px;
+    }
+
+    .day-checkbox {
+        display: grid;
+        justify-items: center;
+        gap: 6px;
+        padding: 10px 6px;
+        color: var(--muted);
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        font-size: 12px;
+        font-weight: 700;
+    }
+
+    .day-checkbox input {
+        width: 16px;
+        height: 16px;
+    }
+
     .empty-note {
         margin-bottom: 18px;
     }
@@ -65,28 +106,71 @@
         </section>
 
         {% if saved %}<div class="notice" role="status">Получатель сохранён.</div>{% endif %}
+        {% if working_hours_saved %}<div class="notice" role="status">Рабочие часы сохранены.</div>{% endif %}
+        {% if working_hours_error %}
+            <div class="notice" role="alert">{{ working_hours_error }}</div>
+        {% endif %}
 
-        <form class="panel settings-panel" method="post" action="/admin/settings/handoff-recipients">
-            <fieldset>
-                <legend>Передача диалога оператору</legend>
-                <p class="field-help">Выберите одного сотрудника, которому бот отправит историю диалога при передаче обращения человеку.</p>
+        <div class="panel settings-panel section-stack">
+            <form method="post" action="/admin/settings/handoff-recipients">
+                <fieldset>
+                    <legend>Передача диалога оператору</legend>
+                    <p class="field-help">Выберите сотрудника, которому бот отправит историю диалога при передаче обращения человеку.</p>
 
-                {% if users %}
-                    <label class="recipient-field">Получатель
-                        <select name="recipient_id">
-                            <option value="">Не назначен</option>
-                            {% for user in users %}
-                                <option value="{{ user.id }}" {% if user.receives_handoffs %}selected{% endif %}>{{ user.display_name }}</option>
-                            {% endfor %}
-                        </select>
+                    {% if users %}
+                        <label class="recipient-field">Получатель
+                            <select name="recipient_id">
+                                <option value="">Не назначен</option>
+                                {% for user in users %}
+                                    <option value="{{ user.id }}" {% if user.receives_handoffs %}selected{% endif %}>{{ user.display_name }}</option>
+                                {% endfor %}
+                            </select>
+                        </label>
+                    {% else %}
+                        <p class="muted empty-note">Нет активных пользователей с номером WhatsApp. Обратитесь к superadmin.</p>
+                    {% endif %}
+                </fieldset>
+
+                <button type="submit" {% if not users %}disabled{% endif %}>Сохранить получателя</button>
+            </form>
+
+            <form method="post" action="/admin/settings/working-hours">
+                <fieldset>
+                    <legend>Рабочие часы менеджера</legend>
+                    <p class="field-help">Если выключено — эскалация на менеджера доступна круглосуточно.</p>
+                    <label class="recipient-field">
+                        <span>
+                            <input type="checkbox" name="working_hours_enabled" value="1" {% if working_hours.enabled %}checked{% endif %}>
+                            Ограничить по времени
+                        </span>
                     </label>
-                {% else %}
-                    <p class="muted empty-note">Нет активных пользователей с номером WhatsApp. Обратитесь к superadmin.</p>
-                {% endif %}
-            </fieldset>
-
-            <button type="submit" {% if not users %}disabled{% endif %}>Сохранить получателя</button>
-        </form>
+                    <div class="working-hours-grid">
+                        <div class="time-grid">
+                            <label class="recipient-field">
+                                <span>Начало</span>
+                                <input type="time" name="working_hours_start" value="{{ working_hours.start }}">
+                            </label>
+                            <label class="recipient-field">
+                                <span>Окончание</span>
+                                <input type="time" name="working_hours_end" value="{{ working_hours.end }}">
+                            </label>
+                        </div>
+                        <div>
+                            <p class="field-help">Рабочие дни</p>
+                            <div class="checkbox-row">
+                                {% for day in working_days %}
+                                    <label class="day-checkbox">
+                                        <input type="checkbox" name="working_days" value="{{ day.value }}" {% if day.value in working_hours.days %}checked{% endif %}>
+                                        {{ day.label }}
+                                    </label>
+                                {% endfor %}
+                            </div>
+                        </div>
+                    </div>
+                </fieldset>
+                <button type="submit">Сохранить рабочие часы</button>
+            </form>
+        </div>
     </main>
 </div>
 {% endblock %}

@@ -43,6 +43,17 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+MANAGER_WORKING_HOURS_ENABLED = _env_bool("MANAGER_WORKING_HOURS_ENABLED", True)
+MANAGER_WORKING_HOURS_START = (os.getenv("MANAGER_WORKING_HOURS_START") or "10:00").strip()
+MANAGER_WORKING_HOURS_END = (os.getenv("MANAGER_WORKING_HOURS_END") or "19:00").strip()
+_manager_working_days_raw = (os.getenv("MANAGER_WORKING_DAYS") or "0,1,2,3,4").strip()
+MANAGER_WORKING_DAYS = frozenset(
+    int(day.strip())
+    for day in _manager_working_days_raw.split(",")
+    if day.strip().isdigit() and 0 <= int(day.strip()) <= 6
+)
+
+
 ENABLE_CHAT_ALLOWLIST = _env_bool("ENABLE_CHAT_ALLOWLIST")
 _allowed_chat_ids_raw = (os.getenv("ALLOWED_CHAT_IDS") or "").strip()
 ALLOWED_CHAT_IDS = [

@@ -91,13 +91,6 @@
         overflow-wrap: anywhere;
     }
 
-    .choice-meta {
-        display: block;
-        margin-top: 3px;
-        color: var(--muted);
-        font-size: 13px;
-    }
-
     .stage-group {
         margin-bottom: 14px;
         padding: 14px;
@@ -120,7 +113,7 @@
 
     .segment-submit {
         display: grid;
-        grid-template-columns: minmax(220px, 360px) auto auto;
+        grid-template-columns: minmax(220px, 360px) minmax(150px, 220px) auto auto;
         gap: 10px;
         align-items: end;
     }
@@ -356,7 +349,6 @@
                                                 <input type="checkbox" name="stage" value="{{ value }}" {% if value in selected_stage_values %}checked{% endif %}>
                                                 <span>
                                                     <span class="choice-title">{{ stage.name }}</span>
-                                                    <span class="choice-meta">{{ stage.status_id }}</span>
                                                 </span>
                                             </label>
                                         </li>
@@ -372,6 +364,11 @@
                     <label class="field-label">
                         Название сегмента
                         <input type="text" name="segment_name" value="{{ segment_name }}" maxlength="120" required>
+                    </label>
+                    <label class="field-label">
+                        Лимит телефонов
+                        <input type="number" name="max_phone_count" min="0" step="1" placeholder="0 = все" value="{{ max_phone_count if max_phone_count is not none else 0 }}">
+                        <span class="field-help">Введите 0, если лимит не нужен.</span>
                     </label>
                     <button type="submit">Собрать сегмент</button>
                     <a class="button secondary" href="/admin/segments">Назад к воронкам</a>

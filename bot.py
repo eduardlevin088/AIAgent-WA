@@ -31,6 +31,7 @@ from database import create_admin, create_operator_handoff
 from database import create_customer_segment_job, create_or_update_user, delete_admin
 from database import execute_query, fail_customer_segment_job, get_admin_ids
 from database import count_active_superadmins, create_admin_user, delete_admin_user_by_id
+from database import get_manager_working_hours_settings, set_manager_working_hours_settings
 from database import get_admin_user_by_id, get_admin_user_by_username, get_customer_segment
 from database import get_analytics_summary, get_handoff_recipient_ids
 from database import get_notification_template_text, get_repair_request_group_stats
@@ -53,6 +54,8 @@ from services.integrations import list_bitrix_deal_categories, list_bitrix_deal_
 from services.integrations import upload_files_to_bitrix
 from services.media_storage import store_media_bytes
 from services.miscellaneous import format_repair_text_minimal as format_message
+from services.miscellaneous import get_manager_working_hours
+from services.miscellaneous import set_manager_working_hours
 from services.new_conv import new_conversation
 from services.photo_processing import maybe_process_incoming_photo
 from services.wazzup import DownloadedContent, WazzupClient
@@ -147,6 +150,13 @@ async def lifespan(app: FastAPI):
     logger.info("Starting WhatsApp webhook service...")
     await init_db()
     await wazzup.start()
+    settings = await get_manager_working_hours_settings()
+    set_manager_working_hours(
+        enabled=bool(settings["enabled"]),
+        start=str(settings["start"]),
+        end=str(settings["end"]),
+        days=set(int(day) for day in settings["days"]),
+    )
     for admin_id in ADMIN_IDS:
         await create_admin(admin_id)
     handoff_timeout_task = asyncio.create_task(manager_handoff_timeout_worker())
@@ -173,6 +183,37 @@ ADMIN_SECTIONS = [
     {"id": "settings", "label": "Настройки", "href": "/admin/settings"},
     {"id": "users", "label": "Пользователи", "href": "/admin/users"},
 ]
+WORKING_DAYS = [
+    {"value": 0, "label": "Пн"},
+    {"value": 1, "label": "Вт"},
+    {"value": 2, "label": "Ср"},
+    {"value": 3, "label": "Чт"},
+    {"value": 4, "label": "Пт"},
+    {"value": 5, "label": "Сб"},
+    {"value": 6, "label": "Вс"},
+]
+
+
+def parse_time_or_default(value: str, default: str) -> str:
+    normalized = (value or "").strip()
+    if len(normalized) != 5 or normalized[2] != ":":
+        return default
+    hour_part, minute_part = normalized.split(":", 1)
+    if not (hour_part.isdigit() and minute_part.isdigit()):
+        return default
+    hour = int(hour_part)
+    minute = int(minute_part)
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return default
+    return f"{hour:02d}:{minute:02d}"
+
+
+def parse_working_days(values: list[str]) -> list[int]:
+    return sorted({
+        int(day)
+        for day in values
+        if day.isdigit() and 0 <= int(day) <= 6
+    })
 def require_internal_api_key(x_api_key: str | None = Header(default=None)) -> None:
     if INTERNAL_API_KEY and x_api_key != INTERNAL_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
@@ -1682,6 +1723,10 @@ def parse_segment_stage_values(values: list[str]) -> list[tuple[int, str]]:
     return pairs
 
 
+def stage_pairs_to_values(values: list[tuple[int, str]]) -> list[str]:
+    return [segment_stage_value(category_id, stage_id) for category_id, stage_id in values]
+
+
 def segment_stage_value(category_id: int, stage_id: str) -> str:
     return f"{int(category_id)}|{stage_id}"
 
@@ -1698,10 +1743,18 @@ async def fetch_bitrix_segment_categories() -> tuple[list[dict], str | None]:
         return [], f"Не удалось получить воронки Bitrix24: {exc}"
 
 
-async def collect_customer_segment_background(segment_id: int, selections: list[dict]) -> None:
+async def collect_customer_segment_background(
+    segment_id: int,
+    selections: list[dict],
+    max_phone_count: int | None,
+) -> None:
     await mark_customer_segment_running(segment_id)
     try:
-        result = await asyncio.to_thread(build_bitrix_customer_segment, selections)
+        result = await asyncio.to_thread(
+            build_bitrix_customer_segment,
+            selections,
+            max_phone_count,
+        )
     except Exception as exc:
         logger.exception("Failed to collect customer segment %s", segment_id)
         await fail_customer_segment_job(segment_id, str(exc))
@@ -1717,6 +1770,7 @@ async def collect_customer_segment_background(segment_id: int, selections: list[
                 "phone_count": result.get("unique_phones"),
                 "contact_count": result.get("unique_contacts"),
                 "deal_count": result.get("total_deals"),
+                "phone_limit": result.get("requested_phone_count_limit"),
             },
             ensure_ascii=False,
         ),
@@ -1735,6 +1789,7 @@ async def render_admin_segments(
     result: dict | None = None,
     error: str | None = None,
     segment_name: str | None = None,
+    max_phone_count: int | None = None,
     status_code: int = 200,
 ) -> HTMLResponse:
     if categories is None:
@@ -1754,6 +1809,7 @@ async def render_admin_segments(
             "error": error,
             "segments": segments,
             "segment_name": segment_name or default_segment_name(),
+            "max_phone_count": max_phone_count,
             "started_segment_id": request.query_params.get("started"),
             "segment_stage_value": segment_stage_value,
         }
@@ -1852,12 +1908,32 @@ async def admin_segments_result(request: Request, background_tasks: BackgroundTa
     if not segment_name:
         segment_name = default_segment_name()
     segment_name = segment_name[:120]
+    max_phone_count_raw = (form.get("max_phone_count") or [""])[0].strip()
+    max_phone_count = None
+    if max_phone_count_raw:
+        if not max_phone_count_raw.isdigit():
+            return await render_admin_segments(
+                request,
+                admin,
+                step="stages",
+                selected_stage_values=stage_pairs_to_values(stage_pairs),
+                error="Лимит телефонов должен быть числом",
+                segment_name=segment_name,
+                max_phone_count=max_phone_count,
+                status_code=400,
+            )
+        max_phone_count = int(max_phone_count_raw)
+        if max_phone_count <= 0:
+            max_phone_count = None
     if not stage_pairs:
         return await render_admin_segments(
             request,
             admin,
+            step="stages",
+            selected_stage_values=stage_pairs_to_values(stage_pairs),
             error="Выберите хотя бы одну стадию",
             segment_name=segment_name,
+            max_phone_count=max_phone_count,
             status_code=400,
         )
 
@@ -1867,8 +1943,13 @@ async def admin_segments_result(request: Request, background_tasks: BackgroundTa
         return await render_admin_segments(
             request,
             admin,
+            step="stages",
+            categories=categories,
+            selected_category_ids=selected_category_ids,
+            selected_stage_values=stage_pairs_to_values(stage_pairs),
             error=category_error,
             segment_name=segment_name,
+            max_phone_count=max_phone_count,
             status_code=502,
         )
 
@@ -1882,10 +1963,13 @@ async def admin_segments_result(request: Request, background_tasks: BackgroundTa
         return await render_admin_segments(
             request,
             admin,
+            step="stages",
             categories=categories,
             selected_category_ids=selected_category_ids,
+            selected_stage_values=stage_pairs_to_values(stage_pairs),
             error=f"Не удалось получить стадии Bitrix24: {exc}",
             segment_name=segment_name,
+            max_phone_count=max_phone_count,
             status_code=502,
         )
 
@@ -1914,9 +1998,15 @@ async def admin_segments_result(request: Request, background_tasks: BackgroundTa
     segment_id = await create_customer_segment_job(
         segment_name,
         selections,
+        max_phone_count,
         int(admin["id"]) if admin.get("id") else None,
     )
-    background_tasks.add_task(collect_customer_segment_background, segment_id, selections)
+    background_tasks.add_task(
+        collect_customer_segment_background,
+        segment_id,
+        selections,
+        max_phone_count,
+    )
     await log_event(
         None,
         "customer_segment_started",
@@ -1926,6 +2016,7 @@ async def admin_segments_result(request: Request, background_tasks: BackgroundTa
                 "admin_id": admin.get("id"),
                 "admin_username": admin.get("username"),
                 "selection_count": len(selections),
+                "selection_phone_limit": max_phone_count,
             },
             ensure_ascii=False,
         ),
@@ -1976,9 +2067,14 @@ async def admin_settings(request: Request):
         if user["is_active"] and user.get("whatsapp_id")
     ]
     context = admin_template_context(request, admin, "settings")
+    working_hours = get_manager_working_hours()
     context.update({
         "users": users,
         "saved": request.query_params.get("saved") == "1",
+        "working_hours_saved": request.query_params.get("working_hours_saved") == "1",
+        "working_hours": working_hours,
+        "working_days": WORKING_DAYS,
+        "working_hours_error": request.query_params.get("working_hours_error"),
     })
     return templates.TemplateResponse("admin_settings.html", context)
 
@@ -2007,6 +2103,44 @@ async def admin_settings_handoff_recipients(request: Request) -> RedirectRespons
 
     await set_handoff_recipients([selected_id] if selected_id is not None else [])
     return RedirectResponse("/admin/settings?saved=1", status_code=303)
+
+
+@app.post("/admin/settings/working-hours")
+async def admin_settings_working_hours(request: Request) -> RedirectResponse:
+    admin = await current_admin(request)
+    if not admin:
+        return RedirectResponse("/admin/login", status_code=303)
+
+    form = await parse_urlencoded_form_multi(request)
+    raw_start = (form.get("working_hours_start") or ["10:00"])[0]
+    raw_end = (form.get("working_hours_end") or ["19:00"])[0]
+    raw_days = parse_working_days(form.get("working_days", []))
+    enabled = bool(form.get("working_hours_enabled"))
+    default_days = [day["value"] for day in WORKING_DAYS]
+    selected_days = raw_days if raw_days else default_days
+
+    current_hours = get_manager_working_hours()
+    start = parse_time_or_default(raw_start, str(current_hours["start"]))
+    end = parse_time_or_default(raw_end, str(current_hours["end"]))
+    if not start or not end:
+        return RedirectResponse(
+            f"/admin/settings?working_hours_error={quote('Неверный формат времени. Используйте HH:MM')}&working_hours_saved=0",
+            status_code=303,
+        )
+
+    await set_manager_working_hours_settings(
+        enabled=enabled,
+        start=start,
+        end=end,
+        working_days=[int(day) for day in selected_days],
+    )
+    set_manager_working_hours(
+        enabled=enabled,
+        start=start,
+        end=end,
+        days=set(int(day) for day in selected_days),
+    )
+    return RedirectResponse("/admin/settings?working_hours_saved=1", status_code=303)
 
 
 @app.get("/admin/users", response_class=HTMLResponse)

@@ -3,7 +3,7 @@ from io import BytesIO
 from typing import Callable
 from config import GPT_KEY, GPT_MODEL, AGENT_PROMPT_MAIN_PATH
 from config import GPT_SPARE_MODEL, GPT_TRANSCRIPTION_MODEL
-from .miscellaneous import current_time_utc_offset
+from .miscellaneous import current_time_utc_offset, is_manager_working_time
 from .integrations import create_bitrix_lead, update_bitrix_repair_request_number
 from database import create_repair_request, get_bitrix_id, set_bitrix_id
 import json
@@ -52,7 +52,12 @@ tools = [
             "type": "object",
             "properties": {
                 "reason": {"type": "string"},
-                "summary": {"type": "string"}
+                "summary": {"type": "string"},
+                "force": {
+                    "type": "boolean",
+                    "description": "Set true only when the customer explicitly insists on a manager outside working hours.",
+                    "default": False,
+                },
             },
             "required": ["reason", "summary"]
         },
@@ -191,16 +196,29 @@ def generate_response(user_message: str | None,
                 output_tokens += usage.output_tokens
             elif item.name == "handoff_to_operator":
                 args = json.loads(item.arguments)
-                handoff = {
-                    "reason": args.get("reason", "Не указана"),
-                    "summary": args.get("summary", "Нет краткого описания")
-                }
+                force = args.get("force") is True
+                if force or is_manager_working_time():
+                    handoff = {
+                        "reason": args.get("reason", "Не указана"),
+                        "summary": args.get("summary", "Нет краткого описания"),
+                    }
+                    handoff_output = (
+                        "Диалог передан оператору. Клиенту нужно коротко сообщить, "
+                        "что менеджер подключится."
+                    )
+                else:
+                    handoff_output = (
+                        "Сейчас менеджеры находятся вне рабочего времени. Передача не выполнена. "
+                        "Сообщи клиенту, что менеджер ответит в рабочее время. "
+                        "Если клиент явно настаивает на разговоре с менеджером, повторно вызови "
+                        "handoff_to_operator с force=true."
+                    )
 
                 agent_input = [{
                     "type": "function_call_output",
                     "call_id": item.call_id,
                     "output": json.dumps({
-                        "func_response": "Диалог передан оператору. Клиенту нужно коротко сообщить, что менеджер подключится."
+                        "func_response": handoff_output,
                     }, ensure_ascii=False)
                 }]
 

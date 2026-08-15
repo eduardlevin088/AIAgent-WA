@@ -45,13 +45,6 @@
         margin-bottom: 16px;
     }
 
-    .stage-code {
-        color: var(--muted);
-        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-        font-size: 12px;
-        white-space: nowrap;
-    }
-
     .message-label {
         color: var(--muted);
         font-size: 12px;
@@ -114,7 +107,6 @@
                 <article class="template-card">
                     <header>
                         <h2>{{ item.stage_name }}</h2>
-                        <span class="stage-code">{{ item.stage_id }}</span>
                     </header>
                     <label class="message-label" for="template-{{ loop.index }}">Текст сообщения</label>
                     <textarea

@@ -1,7 +1,7 @@
 import asyncio
 import os
 import unittest
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, Mock
 from urllib.parse import urlencode
 
@@ -25,6 +25,8 @@ os.environ.setdefault(
 import bot
 import database
 from services import integrations
+from services.agent import tools
+from services.miscellaneous import is_manager_working_time
 from services.wazzup import WazzupClient
 
 
@@ -58,6 +60,18 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
             },
             deal_id=deal_id,
         )
+
+    def test_manager_working_hours_use_kazakhstan_weekday_and_boundaries(self):
+        self.assertTrue(is_manager_working_time(datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc)))
+        self.assertTrue(is_manager_working_time(datetime(2026, 8, 3, 13, 59, tzinfo=timezone.utc)))
+        self.assertFalse(is_manager_working_time(datetime(2026, 8, 3, 14, 0, tzinfo=timezone.utc)))
+        self.assertFalse(is_manager_working_time(datetime(2026, 8, 8, 8, 0, tzinfo=timezone.utc)))
+
+    def test_handoff_tool_exposes_force_override(self):
+        handoff_tool = next(tool for tool in tools if tool["name"] == "handoff_to_operator")
+        force_schema = handoff_tool["parameters"]["properties"]["force"]
+        self.assertEqual(force_schema["type"], "boolean")
+        self.assertFalse(force_schema["default"])
 
     def admin_get_request(
         self,
@@ -740,6 +754,7 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         segment_id = await database.create_customer_segment_job(
             "Сегмент от 30.07.2026",
             [{"category_id": 5, "stage_id": "C5:WON"}],
+            None,
             1,
         )
 

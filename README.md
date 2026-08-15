@@ -48,6 +48,11 @@ ENABLE_CHAT_ALLOWLIST=1
 ALLOWED_CHAT_IDS=77000000000,77111111111
 MANAGER_HANDOFF_TIMEOUT_MINUTES=30
 MANAGER_HANDOFF_POLL_SECONDS=15
+MANAGER_WORKING_HOURS_ENABLED=1
+MANAGER_WORKING_HOURS_START=10:00
+MANAGER_WORKING_HOURS_END=19:00
+MANAGER_WORKING_DAYS=0,1,2,3,4
+# Ниже настройки можно редактировать в /admin/settings. Эти переменные — только стартовые значения.
 BITRIX_STAGE_STATUS_MAP={"C5:UC_SRW3R8":"Принят","C5:EXECUTING":"В работе","C5:FINAL_INVOICE":"Готов","C5:WON":"Выдан"}
 ```
 
@@ -71,6 +76,9 @@ Inbound messages from any other WhatsApp number are ignored before the bot logs 
 `BITRIX_APPLICATION_TOKEN` is optional but recommended. Bitrix sends it as `auth[application_token]` in CRM trigger payloads; when set, `/webhook/bitrix` rejects requests with a different token.
 
 Every distinct human outbound Wazzup message pauses the agent and resets the manager handoff timer. After `MANAGER_HANDOFF_TIMEOUT_MINUTES` without another manager message, the handoff closes and the agent processes future customer messages again. The default is 30 minutes; `MANAGER_HANDOFF_POLL_SECONDS` controls how often expired handoffs are checked.
+
+Manager handoff is available by default Monday-Friday from 10:00 to 19:00 Kazakhstan time. Outside those hours, the bot informs the customer that a manager will respond during working hours. If the customer explicitly insists on speaking to a manager, the LLM can call the handoff tool with `force=true`. Set `MANAGER_WORKING_HOURS_ENABLED=0` to allow handoff 24/7.
+On running environments, the same values are now editable from `/admin/settings` in the "Рабочие часы менеджера" block. Changes are applied immediately and persist in SQLite.
 
 `DB_PATH` must be a full SQLite file path. If unset, the app uses `./data/database.db`.
 
