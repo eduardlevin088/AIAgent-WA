@@ -64,6 +64,37 @@ class _CursorContext:
         return False
 
 
+def _build_context_cursor(
+    pool: asyncpg.Pool,
+    query: str,
+    params: tuple | list | Sequence = (),
+) -> _CursorContext:
+    if params is None:
+        params = ()
+
+    async def _execute() -> _CompatCursor:
+        normalized = _sqlite_to_pg(query)
+        async with pool.acquire() as conn:
+            upper = normalized.lstrip().upper()
+            if " RETURNING " in upper or upper.startswith("SELECT") or upper.startswith("WITH"):
+                rows = await conn.fetch(normalized, *params)
+                rowcount = len(rows)
+                lastrowid = None
+                if rows:
+                    first = rows[0]
+                    if "id" in first.keys():
+                        try:
+                            lastrowid = int(first["id"])
+                        except (TypeError, ValueError):
+                            lastrowid = None
+                return _CompatCursor(rows=list(rows), rowcount=rowcount, lastrowid=lastrowid)
+
+            status = await conn.execute(normalized, *params)
+            return _CompatCursor([], rowcount=_parse_rowcount(status), lastrowid=None)
+
+    return _CursorContext(_execute())
+
+
 def _normalize_sql(sql: str) -> str:
     had_insert_or_ignore = bool(_INSERT_OR_IGNORE_RE.match(sql))
     normalized = _INSERT_OR_IGNORE_RE.sub("INSERT INTO", sql.strip(), count=1)
@@ -200,6 +231,9 @@ async def init_db():
             raise RuntimeError("DATABASE_URL is not configured")
         pool = await asyncpg.create_pool(DATABASE_URL)
         db = _AsyncDatabase(pool)
+        if db and not hasattr(db, "_compat_execute_wrapped"):
+            db._compat_execute_wrapped = True
+            db.execute = lambda query, params=(): _build_context_cursor(db._pool, query, params)  # type: ignore[method-assign]
         
         await create_tables()
         logger.info("Database initialized: %s", DATABASE_URL)
