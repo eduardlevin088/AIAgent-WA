@@ -1252,6 +1252,7 @@ async def cleanup_expired_manager_logs(retention_days: int | None = None) -> dic
     retained_days = max(1, int(retention_days if retention_days is not None else MANAGER_LOG_RETENTION_DAYS))
 
     cutoff_dt = datetime.now(timezone.utc) - timedelta(days=retained_days)
+    cutoff_dt_naive = to_utc_naive_datetime(cutoff_dt)
 
     dialog_cursor = await db.execute(
         "DELETE FROM dialog_messages WHERE created_at <= ?",
@@ -1271,7 +1272,7 @@ async def cleanup_expired_manager_logs(retention_days: int | None = None) -> dic
         WHERE status IN ('closed', 'cancelled')
           AND requested_at <= ?
         """,
-        (cutoff_dt,),
+        (cutoff_dt_naive,),
     )
     await db.commit()
 
