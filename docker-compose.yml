@@ -1,0 +1,14 @@
+services:
+  app:
+    image: python:3.11-slim
+    container_name: samsonite-agent-wa
+    working_dir: /app
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+    ports:
+      - "8000:8000"
+    command: >
+      sh -lc "pip install --no-cache-dir -e . && uvicorn bot:app --host 0.0.0.0 --port 8000"
+    restart: unless-stopped
