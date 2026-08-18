@@ -185,6 +185,14 @@ def _normalize_phone(phone: object) -> str | None:
     return None
 
 
+def _to_e164_like(phone: str | None) -> str | None:
+    if not phone:
+        return None
+    if not PHONE_SEGMENT_PATTERN.fullmatch(phone):
+        return None
+    return f"+{phone}"
+
+
 def _extract_contact_phones(item: dict) -> list[str]:
     phones: list[str] = []
     raw_phone = item.get("phone") or item.get("PHONE")
@@ -273,15 +281,24 @@ def build_bitrix_customer_segment(
             truncated_phones_by_contact.append(
                 {
                     "contact_id": row["contact_id"],
-                    "phones": filtered,
+                    "phones": [_to_e164_like(phone) for phone in filtered],
                 }
             )
         phones_by_contact = truncated_phones_by_contact
+    else:
+        phones_by_contact = [
+            {
+                "contact_id": row["contact_id"],
+                "phones": [_to_e164_like(phone) for phone in row["phones"]],
+            }
+            for row in phones_by_contact
+        ]
+    display_phones = [_to_e164_like(phone) for phone in phones]
     return {
         "stage_rows": stage_rows,
         "phones_by_contact": phones_by_contact,
-        "phones": phones,
-        "phone_text": "\n".join(phones),
+        "phones": display_phones,
+        "phone_text": "\n".join(display_phones),
         "total_deals": sum(row["deal_count"] for row in stage_rows),
         "unique_contacts": len(all_contact_ids),
         "requested_phone_count_limit": max_phone_count or 0,

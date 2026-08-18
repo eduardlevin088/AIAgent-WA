@@ -751,7 +751,7 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["total_deals"], 4)
         self.assertEqual(result["unique_contacts"], 3)
-        self.assertEqual(result["phones"], ["77010000000", "77075544492"])
+        self.assertEqual(result["phones"], ["+77010000000", "+77075544492"])
         self.assertEqual(result["stage_rows"][0]["contact_count"], 3)
 
     async def test_customer_segment_history_persists_completed_phone_list(self):
@@ -767,7 +767,7 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
             segment_id,
             {
                 "stage_rows": [{"stage_id": "C5:WON"}],
-                "phone_text": "77010000000\n77075544492",
+                "phone_text": "+77010000000\n+77075544492",
                 "unique_phones": 2,
                 "unique_contacts": 3,
                 "total_deals": 4,
