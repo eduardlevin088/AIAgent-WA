@@ -1812,7 +1812,21 @@ async def list_customers(q: str | None = None, limit: int = 100) -> list[dict]:
             LIMIT 1
         )
         {where_clause}
-        GROUP BY u.user_id
+        GROUP BY
+            u.user_id,
+            u.username,
+            u.first_name,
+            u.last_name,
+            u.bitrix_id,
+            u.created_at,
+            u.updated_at,
+            latest.name,
+            latest.phone,
+            latest.city,
+            latest.request_number,
+            latest.status,
+            latest.deal_id,
+            latest.created_at
         ORDER BY COALESCE(latest.created_at, u.updated_at, u.created_at) DESC
         LIMIT ?
     """, params) as cursor:
@@ -1857,14 +1871,20 @@ async def get_repair_request_group_stats(group_by: str) -> list[dict[str, int | 
         else "COALESCE(NULLIF(TRIM(city), ''), 'Не указан')"
     )
     async with db.execute(f"""
-        SELECT {expression} AS label, COUNT(*) AS count
-        FROM repair_requests
-        GROUP BY {expression}
-        ORDER BY count DESC, LOWER(label)
+        WITH grouped AS (
+            SELECT
+                {expression} AS group_label,
+                COUNT(*) AS count
+            FROM repair_requests
+            GROUP BY {expression}
+        )
+        SELECT group_label, count
+        FROM grouped
+        ORDER BY count DESC, LOWER(group_label)
     """) as cursor:
         rows = await cursor.fetchall()
 
-    counts = {str(row["label"]): int(row["count"] or 0) for row in rows}
+    counts = {str(row["group_label"]): int(row["count"] or 0) for row in rows}
     if group_by == "city":
         return [
             {"label": label, "count": count}
@@ -2038,7 +2058,7 @@ async def list_customer_segments(limit: int = 20) -> list[dict]:
             max_phone_count,
             created_at, started_at, completed_at, updated_at
         FROM customer_segments
-        ORDER BY datetime(created_at) DESC, id DESC
+        ORDER BY created_at DESC, id DESC
         LIMIT ?
     """, (limit,)) as cursor:
         rows = await cursor.fetchall()
