@@ -1251,7 +1251,7 @@ async def cleanup_expired_manager_logs(retention_days: int | None = None) -> dic
 
     retained_days = max(1, int(retention_days if retention_days is not None else MANAGER_LOG_RETENTION_DAYS))
 
-    cutoff_dt = (datetime.now(timezone.utc) - timedelta(days=retained_days)).isoformat()
+    cutoff_dt = datetime.now(timezone.utc) - timedelta(days=retained_days)
 
     dialog_cursor = await db.execute(
         "DELETE FROM dialog_messages WHERE created_at <= ?",
@@ -1284,13 +1284,28 @@ async def cleanup_expired_manager_logs(retention_days: int | None = None) -> dic
     }
 
 
+def utc_now_datetime() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return utc_now_datetime().isoformat()
 
 
-def parse_utc_timestamp(value: str | None) -> datetime:
+def to_utc_naive_datetime(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def parse_utc_timestamp(value: object | None) -> datetime:
     if not value:
         return datetime.now(timezone.utc)
+
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
 
     normalized = str(value).strip().replace("Z", "+00:00")
     try:
@@ -1321,9 +1336,18 @@ async def create_operator_handoff(
         existing = await cursor.fetchone()
 
     if existing:
-        return dict(existing)
+        handoff = dict(existing)
+        if isinstance(handoff.get("requested_at"), datetime):
+            handoff["requested_at"] = handoff["requested_at"].isoformat()
+        if isinstance(handoff.get("first_manager_response_at"), datetime):
+            handoff["first_manager_response_at"] = handoff["first_manager_response_at"].isoformat()
+        if isinstance(handoff.get("last_manager_message_at"), datetime):
+            handoff["last_manager_message_at"] = handoff["last_manager_message_at"].isoformat()
+        if isinstance(handoff.get("closed_at"), datetime):
+            handoff["closed_at"] = handoff["closed_at"].isoformat()
+        return handoff
 
-    requested_at = utc_now_iso()
+    requested_at = to_utc_naive_datetime(utc_now_datetime())
     cursor = await db.execute("""
         INSERT INTO operator_handoffs (user_id, reason, summary, requested_at)
         VALUES (?, ?, ?, ?)
@@ -1337,7 +1361,7 @@ async def create_operator_handoff(
         "reason": reason,
         "summary": summary,
         "status": "waiting",
-        "requested_at": requested_at,
+        "requested_at": requested_at.isoformat(),
     }
 
 
@@ -1396,7 +1420,8 @@ async def _record_operator_message(
         handoff = await cursor.fetchone()
 
     responded_dt = parse_utc_timestamp(responded_at)
-    normalized_responded_at = responded_dt.isoformat()
+    normalized_responded_at_dt = to_utc_naive_datetime(responded_dt)
+    normalized_responded_at = normalized_responded_at_dt.isoformat()
 
     if not handoff:
         cursor = await db.execute("""
@@ -1411,9 +1436,9 @@ async def _record_operator_message(
             user_id,
             "Менеджер подключился к диалогу",
             "Менеджер прервал автоматический диалог",
-            normalized_responded_at,
-            normalized_responded_at,
-            normalized_responded_at,
+            normalized_responded_at_dt,
+            normalized_responded_at_dt,
+            normalized_responded_at_dt,
             manager_message_id,
             manager_id,
             manager_name,
@@ -1453,8 +1478,8 @@ async def _record_operator_message(
                 manager_name = ?
             WHERE id = ? AND status = 'waiting'
         """, (
-            normalized_responded_at,
-            normalized_responded_at,
+            normalized_responded_at_dt,
+            normalized_responded_at_dt,
             response_time_seconds,
             manager_message_id,
             manager_id,
@@ -1480,7 +1505,8 @@ async def _record_operator_message(
         return handoff_data
 
     previous_message_dt = parse_utc_timestamp(handoff_data.get("last_manager_message_at"))
-    last_manager_message_at = max(previous_message_dt, responded_dt).isoformat()
+    last_manager_message_at_dt = to_utc_naive_datetime(max(previous_message_dt, responded_dt))
+    last_manager_message_at = last_manager_message_at_dt.isoformat()
     cursor = await db.execute("""
         UPDATE operator_handoffs
         SET last_manager_message_at = ?,
@@ -1488,7 +1514,7 @@ async def _record_operator_message(
             manager_name = COALESCE(?, manager_name)
         WHERE id = ? AND status = 'active'
     """, (
-        last_manager_message_at,
+        last_manager_message_at_dt,
         manager_id,
         manager_name,
         handoff_data["id"],
@@ -1524,8 +1550,8 @@ async def _close_expired_operator_handoffs(
         raise RuntimeError("Database not initialized")
 
     current_dt = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
-    cutoff = (current_dt - timedelta(minutes=timeout_minutes)).isoformat()
-    closed_at = current_dt.isoformat()
+    cutoff = to_utc_naive_datetime(current_dt - timedelta(minutes=timeout_minutes))
+    closed_at = current_dt
     async with db.execute("""
         SELECT id, user_id, last_manager_message_at
         FROM operator_handoffs
@@ -1561,8 +1587,12 @@ async def _close_expired_operator_handoffs(
         closed.append({
             "id": candidate["id"],
             "user_id": candidate["user_id"],
-            "last_manager_message_at": candidate["last_manager_message_at"],
-            "closed_at": closed_at,
+            "last_manager_message_at": (
+                candidate["last_manager_message_at"].isoformat()
+                if hasattr(candidate["last_manager_message_at"], "isoformat")
+                else candidate["last_manager_message_at"]
+            ),
+            "closed_at": closed_at.isoformat(),
         })
 
     await db.commit()
@@ -1579,7 +1609,7 @@ async def cancel_open_operator_handoff(user_id: str) -> int:
             closed_at = ?,
             closed_reason = 'manual_resume'
         WHERE user_id = ? AND status IN ('waiting', 'active')
-    """, (utc_now_iso(), user_id))
+    """, (utc_now_datetime(), user_id))
     await db.commit()
     return cursor.rowcount
 
