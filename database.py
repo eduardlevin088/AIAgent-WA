@@ -1,20 +1,132 @@
 import asyncio
 import json
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Sequence
 
-import aiosqlite
+import asyncpg
 
-from config import BITRIX_BOT_STAGE_ID, BITRIX_STAGE_RANKS, DB_PATH
+from config import BITRIX_BOT_STAGE_ID, BITRIX_STAGE_RANKS, DATABASE_URL
 from config import MANAGER_WORKING_DAYS, MANAGER_WORKING_HOURS_ENABLED
 from config import MANAGER_WORKING_HOURS_END, MANAGER_WORKING_HOURS_START
+from config import MANAGER_LOG_RETENTION_DAYS
 from prettytable import PrettyTable
 
 
 logger = logging.getLogger(__name__)
 
-db: Optional[aiosqlite.Connection] = None
+_QUESTION_MARK_RE = re.compile(r"\?")
+_INSERT_OR_IGNORE_RE = re.compile(r"(?i)^\s*INSERT\s+OR\s+IGNORE\s+INTO")
+
+
+class _CompatCursor:
+    def __init__(
+        self,
+        rows: list,
+        rowcount: int = 0,
+        lastrowid: int | None = None,
+    ):
+        self._rows = rows
+        self.rowcount = rowcount
+        self.lastrowid = lastrowid
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def fetchone(self):
+        if not self._rows:
+            return None
+        return self._rows.pop(0)
+
+    async def fetchall(self):
+        rows = self._rows
+        self._rows = []
+        return rows
+
+
+def _normalize_sql(sql: str) -> str:
+    had_insert_or_ignore = bool(_INSERT_OR_IGNORE_RE.match(sql))
+    normalized = _INSERT_OR_IGNORE_RE.sub("INSERT INTO", sql.strip(), count=1)
+    if had_insert_or_ignore and "ON CONFLICT" not in normalized.upper():
+        base = normalized.rstrip()
+        if not base.endswith("ON CONFLICT DO NOTHING"):
+            normalized = f"{base} ON CONFLICT DO NOTHING"
+    return normalized
+
+
+def _sqlite_to_pg(sql: str) -> str:
+    sql = _normalize_sql(sql)
+
+    i = 0
+    def repl(_: re.Match[str]) -> str:
+        nonlocal i
+        i += 1
+        return f"${i}"
+
+    return _QUESTION_MARK_RE.sub(repl, sql)
+
+
+def _parse_rowcount(status: str) -> int:
+    if not status:
+        return 0
+    parts = status.split()
+    if not parts:
+        return 0
+    if parts[0] == "INSERT" and len(parts) >= 3 and parts[-1].isdigit():
+        return int(parts[-1])
+    if len(parts) == 1:
+        return 0
+    return int(parts[-1]) if parts[-1].isdigit() else 0
+
+
+class _AsyncDatabase:
+    def __init__(self, pool: asyncpg.Pool):
+        self._pool = pool
+
+    async def close(self) -> None:
+        await self._pool.close()
+
+    async def commit(self) -> None:
+        return None
+
+    async def rollback(self) -> None:
+        return None
+
+    async def execute(self, query: str, params: tuple | list | Sequence = ()) -> _CompatCursor:
+        if params is None:
+            params = ()
+        normalized = _sqlite_to_pg(query)
+        async with self._pool.acquire() as conn:
+            upper = normalized.lstrip().upper()
+            if " RETURNING " in upper or upper.startswith("SELECT") or upper.startswith("WITH"):
+                rows = await conn.fetch(normalized, *params)
+                rowcount = len(rows)
+                lastrowid = None
+                if rows:
+                    first = rows[0]
+                    if "id" in first.keys():
+                        try:
+                            lastrowid = int(first["id"])
+                        except (TypeError, ValueError):
+                            lastrowid = None
+                return _CompatCursor(rows=list(rows), rowcount=rowcount, lastrowid=lastrowid)
+
+            status = await conn.execute(normalized, *params)
+            return _CompatCursor([], rowcount=_parse_rowcount(status), lastrowid=None)
+
+    async def executemany(self, query: str, seq: Sequence[Sequence]) -> _CompatCursor:
+        rowcount = 0
+        for params in seq:
+            cursor = await self.execute(query, params)
+            rowcount += cursor.rowcount
+        return _CompatCursor([], rowcount=rowcount)
+
+
+db: Optional[_AsyncDatabase] = None
 _handoff_operation_lock = asyncio.Lock()
 
 DEFAULT_NOTIFICATION_TEMPLATES = (
@@ -61,12 +173,13 @@ DEFAULT_NOTIFICATION_TEMPLATES = (
 async def init_db():
     global db
     try:
-        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-        db = await aiosqlite.connect(DB_PATH)
-        db.row_factory = aiosqlite.Row
+        if not DATABASE_URL:
+            raise RuntimeError("DATABASE_URL is not configured")
+        pool = await asyncpg.create_pool(DATABASE_URL)
+        db = _AsyncDatabase(pool)
         
         await create_tables()
-        logger.info(f"Database initialized: {DB_PATH}")
+        logger.info("Database initialized: %s", DATABASE_URL)
     except Exception as e:
         logger.error(f"Error initializing database: {e}")
         raise
@@ -85,8 +198,8 @@ async def create_tables():
             last_name TEXT,
             conversation TEXT,
             bitrix_id INTEGER,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW()
         )
     """)
     
@@ -95,14 +208,14 @@ async def create_tables():
         CREATE TABLE IF NOT EXISTS admin (
             user_id TEXT PRIMARY KEY,
             username TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMPTZ DEFAULT NOW()
         )
     """)
 
     # Web admin users
     await db.execute("""
         CREATE TABLE IF NOT EXISTS admin_users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
             username TEXT UNIQUE NOT NULL,
             display_name TEXT,
             password_hash TEXT NOT NULL,
@@ -110,8 +223,8 @@ async def create_tables():
             is_active INTEGER NOT NULL DEFAULT 1,
             whatsapp_id TEXT,
             receives_handoffs INTEGER NOT NULL DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW()
         )
     """)
     await ensure_column("admin_users", "display_name", "display_name TEXT")
@@ -128,8 +241,8 @@ async def create_tables():
             stage_id TEXT PRIMARY KEY,
             stage_name TEXT NOT NULL,
             text TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW()
         )
     """)
     await db.executemany("""
@@ -153,7 +266,7 @@ async def create_tables():
             media_type TEXT,
             source_message_id TEXT,
             content_uri TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMPTZ DEFAULT NOW()
         )
     """)
     await ensure_column("media", "file_path", "file_path TEXT")
@@ -176,7 +289,7 @@ async def create_tables():
         CREATE TABLE IF NOT EXISTS processed_messages (
             message_id TEXT PRIMARY KEY,
             user_id TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMP DEFAULT NOW()
         )
     """)
 
@@ -185,7 +298,7 @@ async def create_tables():
             user_id TEXT PRIMARY KEY,
             is_paused INTEGER DEFAULT 0,
             reason TEXT,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            updated_at TIMESTAMPTZ DEFAULT NOW()
         )
     """)
 
@@ -220,38 +333,38 @@ async def create_tables():
 
     await db.execute("""
         CREATE TABLE IF NOT EXISTS dialog_messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
             user_id TEXT,
             role TEXT,
             message_type TEXT,
             text TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMPTZ DEFAULT NOW()
         )
     """)
 
     await db.execute("""
         CREATE TABLE IF NOT EXISTS feedback (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
             user_id TEXT,
             rating INTEGER,
             comment TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMPTZ DEFAULT NOW()
         )
     """)
 
     await db.execute("""
         CREATE TABLE IF NOT EXISTS analytics_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
             user_id TEXT,
             event_type TEXT,
             payload TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMPTZ DEFAULT NOW()
         )
     """)
 
     await db.execute("""
         CREATE TABLE IF NOT EXISTS operator_handoffs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
             user_id TEXT NOT NULL,
             reason TEXT,
             summary TEXT,
@@ -264,7 +377,7 @@ async def create_tables():
             manager_message_id TEXT UNIQUE,
             manager_id TEXT,
             manager_name TEXT,
-            closed_at TIMESTAMP,
+            closed_at TIMESTAMPTZ,
             closed_reason TEXT
         )
     """)
@@ -295,7 +408,7 @@ async def create_tables():
 
     await db.execute("""
         CREATE TABLE IF NOT EXISTS repair_requests (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
             request_number INTEGER UNIQUE,
             user_id TEXT,
             deal_id INTEGER,
@@ -316,8 +429,8 @@ async def create_tables():
             estimated_price_range TEXT,
             warranty_context TEXT,
             convenient_time TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW()
         )
     """)
     await ensure_column(
@@ -333,7 +446,7 @@ async def create_tables():
 
     await db.execute("""
         CREATE TABLE IF NOT EXISTS customer_segments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
             name TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'pending',
             selections_json TEXT NOT NULL,
@@ -345,10 +458,10 @@ async def create_tables():
             max_phone_count INTEGER NOT NULL DEFAULT 0,
             error TEXT,
             created_by INTEGER,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            created_at TIMESTAMPTZ DEFAULT NOW(),
             started_at TIMESTAMP,
             completed_at TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            updated_at TIMESTAMPTZ DEFAULT NOW()
         )
     """)
     await ensure_column("customer_segments", "name", "name TEXT NOT NULL DEFAULT 'Сегмент'")
@@ -371,7 +484,7 @@ async def create_tables():
     await ensure_column(
         "customer_segments",
         "updated_at",
-        "updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+        "updated_at TIMESTAMP DEFAULT NOW()",
     )
     await db.execute("""
         CREATE INDEX IF NOT EXISTS idx_customer_segments_created_at
@@ -387,10 +500,18 @@ async def ensure_column(table: str, column: str, definition: str):
     if db is None:
         raise RuntimeError("Database not initialized")
 
-    async with db.execute(f"PRAGMA table_info({table})") as cursor:
+    async with db.execute(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = ?
+        """,
+        (table,),
+    ) as cursor:
         rows = await cursor.fetchall()
 
-    columns = {row["name"] for row in rows}
+    columns = {row["column_name"] for row in rows}
     if column not in columns:
         await db.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
 
@@ -418,7 +539,7 @@ async def create_or_update_user(user_id: str, username: Optional[str] = None,
             first_name = excluded.first_name,
             last_name = excluded.last_name,
             conversation = excluded.conversation,
-            updated_at = CURRENT_TIMESTAMP
+            updated_at = NOW()
     """, (user_id, username, first_name, last_name, conversation))
     await db.commit()
 
@@ -449,7 +570,7 @@ async def set_user_conversation(user_id: str, conversation: str):
         raise RuntimeError("Database not initialized")
     
     await db.execute("""
-        UPDATE users SET conversation = ?, updated_at = CURRENT_TIMESTAMP
+        UPDATE users SET conversation = ?, updated_at = NOW()
         WHERE user_id = ?
     """, (conversation, user_id))
     await db.commit()
@@ -461,9 +582,9 @@ async def create_admin(user_id: str):
     
     await db.execute("""
         INSERT INTO admin (user_id, created_at)
-        VALUES (?, CURRENT_TIMESTAMP)
+        VALUES (?, NOW())
         ON CONFLICT(user_id) DO UPDATE SET
-            created_at = CURRENT_TIMESTAMP
+            created_at = NOW()
     """, (user_id,))
     await db.commit()
 
@@ -580,7 +701,7 @@ async def upsert_admin_user(username: str, password_hash: str, role: str = "supe
             role = excluded.role,
             display_name = COALESCE(admin_users.display_name, excluded.display_name),
             is_active = 1,
-            updated_at = CURRENT_TIMESTAMP
+            updated_at = NOW()
     """, (username, username, password_hash, role))
     await db.commit()
 
@@ -601,9 +722,10 @@ async def create_admin_user(
                 username, display_name, password_hash, role, is_active, whatsapp_id
             )
             VALUES (?, ?, ?, ?, 1, ?)
+            RETURNING id
         """, (username, display_name.strip(), password_hash, role, whatsapp_id.strip()))
         await db.commit()
-    except aiosqlite.IntegrityError as exc:
+    except asyncpg.UniqueViolationError as exc:
         raise ValueError("Пользователь с таким логином уже существует") from exc
     return int(cursor.lastrowid)
 
@@ -635,7 +757,7 @@ async def update_admin_user(
         cursor = await db.execute(f"""
             UPDATE admin_users
             SET username = ?, display_name = ?, role = ?, whatsapp_id = ?, is_active = ?,
-                updated_at = CURRENT_TIMESTAMP{password_update}
+                updated_at = NOW(){password_update}
             WHERE id = ?
         """, params)
         if not is_active or not whatsapp_id:
@@ -644,7 +766,7 @@ async def update_admin_user(
                 (admin_id,),
             )
         await db.commit()
-    except aiosqlite.IntegrityError as exc:
+    except asyncpg.UniqueViolationError as exc:
         raise ValueError("Пользователь с таким логином уже существует") from exc
     return cursor.rowcount > 0
 
@@ -657,7 +779,7 @@ async def list_admin_users() -> list[dict]:
         SELECT id, username, display_name, role, is_active, whatsapp_id, receives_handoffs,
                created_at, updated_at
         FROM admin_users
-        ORDER BY username COLLATE NOCASE, id
+        ORDER BY LOWER(username), id
     """) as cursor:
         rows = await cursor.fetchall()
 
@@ -675,13 +797,13 @@ async def set_handoff_recipients(admin_ids: Sequence[int]) -> None:
 
     selected_ids = sorted(set(admin_ids))
     await db.execute(
-        "UPDATE admin_users SET receives_handoffs = 0, updated_at = CURRENT_TIMESTAMP"
+        "UPDATE admin_users SET receives_handoffs = 0, updated_at = NOW()"
     )
     if selected_ids:
         placeholders = ", ".join("?" for _ in selected_ids)
         await db.execute(f"""
             UPDATE admin_users
-            SET receives_handoffs = 1, updated_at = CURRENT_TIMESTAMP
+            SET receives_handoffs = 1, updated_at = NOW()
             WHERE id IN ({placeholders})
               AND is_active = 1
               AND whatsapp_id IS NOT NULL
@@ -701,7 +823,7 @@ async def get_handoff_recipient_ids() -> list[str]:
           AND is_active = 1
           AND whatsapp_id IS NOT NULL
           AND TRIM(whatsapp_id) != ''
-        ORDER BY username COLLATE NOCASE, id
+        ORDER BY LOWER(username), id
     """) as cursor:
         rows = await cursor.fetchall()
     return [str(row["whatsapp_id"]).strip() for row in rows]
@@ -977,8 +1099,9 @@ async def mark_message_processed(message_id: str, user_id: str) -> bool:
         raise RuntimeError("Database not initialized")
 
     cursor = await db.execute("""
-        INSERT OR IGNORE INTO processed_messages (message_id, user_id)
+        INSERT INTO processed_messages (message_id, user_id)
         VALUES (?, ?)
+        ON CONFLICT(message_id) DO NOTHING
     """, (message_id, user_id))
     await db.commit()
     return cursor.rowcount == 1
@@ -1002,11 +1125,11 @@ async def set_bot_paused(user_id: str, is_paused: bool, reason: str | None = Non
 
     await db.execute("""
         INSERT INTO bot_state (user_id, is_paused, reason, updated_at)
-        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+        VALUES (?, ?, ?, NOW())
         ON CONFLICT(user_id) DO UPDATE SET
             is_paused = excluded.is_paused,
             reason = excluded.reason,
-            updated_at = CURRENT_TIMESTAMP
+            updated_at = NOW()
     """, (user_id, int(is_paused), reason))
     await db.commit()
 
@@ -1065,6 +1188,45 @@ async def log_event(user_id: str | None, event_type: str, payload: str | None = 
     await db.commit()
 
 
+async def cleanup_expired_manager_logs(retention_days: int | None = None) -> dict[str, int]:
+    if db is None:
+        raise RuntimeError("Database not initialized")
+
+    retained_days = max(1, int(retention_days if retention_days is not None else MANAGER_LOG_RETENTION_DAYS))
+
+    cutoff_dt = (datetime.now(timezone.utc) - timedelta(days=retained_days)).isoformat()
+
+    dialog_cursor = await db.execute(
+        "DELETE FROM dialog_messages WHERE created_at <= ?",
+        (cutoff_dt,),
+    )
+    feedback_cursor = await db.execute(
+        "DELETE FROM feedback WHERE created_at <= ?",
+        (cutoff_dt,),
+    )
+    analytics_cursor = await db.execute(
+        "DELETE FROM analytics_events WHERE created_at <= ?",
+        (cutoff_dt,),
+    )
+    handoff_cursor = await db.execute(
+        """
+        DELETE FROM operator_handoffs
+        WHERE status IN ('closed', 'cancelled')
+          AND requested_at <= ?
+        """,
+        (cutoff_dt,),
+    )
+    await db.commit()
+
+    return {
+        "retained_days": retained_days,
+        "dialog_messages_deleted": int(dialog_cursor.rowcount),
+        "feedback_deleted": int(feedback_cursor.rowcount),
+        "analytics_events_deleted": int(analytics_cursor.rowcount),
+        "operator_handoffs_deleted": int(handoff_cursor.rowcount),
+    }
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -1108,6 +1270,7 @@ async def create_operator_handoff(
     cursor = await db.execute("""
         INSERT INTO operator_handoffs (user_id, reason, summary, requested_at)
         VALUES (?, ?, ?, ?)
+        RETURNING id
     """, (user_id, reason, summary, requested_at))
     await db.commit()
 
@@ -1141,11 +1304,11 @@ async def record_operator_message(
 async def _pause_bot_for_manager(user_id: str) -> None:
     await db.execute("""
         INSERT INTO bot_state (user_id, is_paused, reason, updated_at)
-        VALUES (?, 1, 'Менеджер ведет диалог', CURRENT_TIMESTAMP)
+        VALUES (?, 1, 'Менеджер ведет диалог', NOW())
         ON CONFLICT(user_id) DO UPDATE SET
             is_paused = 1,
             reason = 'Менеджер ведет диалог',
-            updated_at = CURRENT_TIMESTAMP
+            updated_at = NOW()
     """, (user_id,))
 
 
@@ -1186,6 +1349,7 @@ async def _record_operator_message(
                 manager_message_id, manager_id, manager_name
             )
             VALUES (?, ?, ?, 'manager', 'active', ?, ?, ?, ?, ?, ?)
+            RETURNING id
         """, (
             user_id,
             "Менеджер подключился к диалогу",
@@ -1331,11 +1495,11 @@ async def _close_expired_operator_handoffs(
 
         await db.execute("""
             INSERT INTO bot_state (user_id, is_paused, reason, updated_at)
-            VALUES (?, 0, NULL, CURRENT_TIMESTAMP)
+            VALUES (?, 0, NULL, NOW())
             ON CONFLICT(user_id) DO UPDATE SET
                 is_paused = 0,
                 reason = NULL,
-                updated_at = CURRENT_TIMESTAMP
+                updated_at = NOW()
         """, (candidate["user_id"],))
         closed.append({
             "id": candidate["id"],
@@ -1409,6 +1573,7 @@ async def create_repair_request(
             estimated_price_range, warranty_context, convenient_time
         )
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        RETURNING id
     """, (
         user_id,
         deal_id,
@@ -1434,7 +1599,7 @@ async def create_repair_request(
 
     await db.execute("""
         UPDATE repair_requests
-        SET request_number = ?, updated_at = CURRENT_TIMESTAMP
+        SET request_number = ?, updated_at = NOW()
         WHERE id = ?
     """, (request_number, request_id))
     await db.commit()
@@ -1607,7 +1772,7 @@ async def get_repair_request_group_stats(group_by: str) -> list[dict[str, int | 
         SELECT {expression} AS label, COUNT(*) AS count
         FROM repair_requests
         GROUP BY {expression}
-        ORDER BY count DESC, label COLLATE NOCASE
+        ORDER BY count DESC, LOWER(label)
     """) as cursor:
         rows = await cursor.fetchall()
 
@@ -1636,7 +1801,7 @@ async def list_notification_templates() -> list[dict[str, str]]:
     async with db.execute("""
         SELECT stage_id, stage_name, text
         FROM notification_templates
-        ORDER BY rowid
+        ORDER BY stage_id
     """) as cursor:
         rows = await cursor.fetchall()
     return [dict(row) for row in rows]
@@ -1668,7 +1833,7 @@ async def update_notification_templates(template_texts: dict[str, str]) -> None:
 
     await db.executemany("""
         UPDATE notification_templates
-        SET text = ?, updated_at = CURRENT_TIMESTAMP
+        SET text = ?, updated_at = NOW()
         WHERE stage_id = ?
     """, [
         (text, stage_id)
@@ -1691,6 +1856,7 @@ async def create_customer_segment_job(
             name, status, selections_json, max_phone_count, created_by
         )
         VALUES (?, 'pending', ?, ?, ?)
+        RETURNING id
     """, (
         name,
         json.dumps(selections, ensure_ascii=False),
@@ -1708,8 +1874,8 @@ async def mark_customer_segment_running(segment_id: int) -> None:
     await db.execute("""
         UPDATE customer_segments
         SET status = 'running',
-            started_at = CURRENT_TIMESTAMP,
-            updated_at = CURRENT_TIMESTAMP,
+            started_at = NOW(),
+            updated_at = NOW(),
             error = NULL
         WHERE id = ?
     """, (segment_id,))
@@ -1730,8 +1896,8 @@ async def complete_customer_segment_job(segment_id: int, result: dict) -> None:
             deal_count = ?,
             max_phone_count = COALESCE(max_phone_count, 0),
             error = NULL,
-            completed_at = CURRENT_TIMESTAMP,
-            updated_at = CURRENT_TIMESTAMP
+            completed_at = NOW(),
+            updated_at = NOW()
         WHERE id = ?
     """, (
         json.dumps(result.get("stage_rows") or [], ensure_ascii=False),
@@ -1752,8 +1918,8 @@ async def fail_customer_segment_job(segment_id: int, error: str) -> None:
         UPDATE customer_segments
         SET status = 'failed',
             error = ?,
-            completed_at = CURRENT_TIMESTAMP,
-            updated_at = CURRENT_TIMESTAMP
+            completed_at = NOW(),
+            updated_at = NOW()
         WHERE id = ?
     """, (error[:2000], segment_id))
     await db.commit()
@@ -1814,7 +1980,7 @@ async def update_repair_request_status_by_deal_id(deal_id: int, status: str) -> 
 
     cursor = await db.execute("""
         UPDATE repair_requests
-        SET status = ?, updated_at = CURRENT_TIMESTAMP
+        SET status = ?, updated_at = NOW()
         WHERE deal_id = ?
     """, (status, deal_id))
     await db.commit()
@@ -1889,7 +2055,7 @@ async def sync_repair_request_status_by_deal_id(
         SET status = ?,
             furthest_bitrix_stage_id = ?,
             furthest_bitrix_stage_rank = ?,
-            updated_at = CURRENT_TIMESTAMP
+            updated_at = NOW()
         WHERE id = ?
     """, (
         status,

@@ -5,7 +5,6 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, Mock
 from urllib.parse import urlencode
 
-import aiosqlite
 from starlette.requests import Request
 
 
@@ -32,6 +31,11 @@ from services.wazzup import WazzupClient
 
 class WorkflowTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        try:
+            import aiosqlite  # type: ignore
+        except ModuleNotFoundError as exc:
+            raise unittest.SkipTest("aiosqlite is not installed for local unit-test DB backend") from exc
+
         self.previous_db = database.db
         database.db = await aiosqlite.connect(":memory:")
         database.db.row_factory = aiosqlite.Row

@@ -23,6 +23,7 @@ from config import ALLOWED_CHAT_IDS, ENABLE_CHAT_ALLOWLIST
 from config import BITRIX_APPLICATION_TOKEN, BITRIX_STAGE_STATUS_MAP
 from config import GPT_MODEL, GREETING_TEXT_PATH, INTERNAL_API_KEY, LIMIT_PER_USER
 from config import MANAGER_HANDOFF_POLL_SECONDS, MANAGER_HANDOFF_TIMEOUT_MINUTES
+from config import MANAGER_LOG_CLEANUP_INTERVAL_SECONDS
 from config import SUPERADMIN_ID, WAZZUP_CHANNEL_ID, WAZZUP_CHAT_LINK_BASE, WAZZUP_CHAT_TYPE
 from database import add_token_usage, append_dialog_message, cancel_open_operator_handoff
 from database import close_db, close_expired_operator_handoffs, complete_customer_segment_job
@@ -42,6 +43,7 @@ from database import is_bot_paused, list_admin_users, list_customers, list_repai
 from database import list_customer_segments, list_notification_templates
 from database import log_event, mark_message_processed
 from database import mark_customer_segment_running, record_operator_message
+from database import cleanup_expired_manager_logs
 from database import REPAIR_REQUEST_STATUSES, save_feedback
 from database import save_media_file, set_bot_paused, set_handoff_recipients
 from database import sync_repair_request_status_by_deal_id
@@ -58,6 +60,7 @@ from services.miscellaneous import get_manager_working_hours
 from services.miscellaneous import set_manager_working_hours
 from services.new_conv import new_conversation
 from services.photo_processing import maybe_process_incoming_photo
+from services.warranty import warranty_assessment_message
 from services.wazzup import DownloadedContent, WazzupClient
 
 
@@ -145,6 +148,31 @@ async def manager_handoff_timeout_worker() -> None:
         await asyncio.sleep(MANAGER_HANDOFF_POLL_SECONDS)
 
 
+async def manager_logs_cleanup_worker() -> None:
+    while True:
+        try:
+            cleanup_summary = await cleanup_expired_manager_logs()
+            if sum(
+                value
+                for key, value in cleanup_summary.items()
+                if key.endswith("_deleted")
+            ):
+                logger.info(
+                    "Manager logs cleanup: days=%s dialog=%s feedback=%s analytics=%s handoffs=%s",
+                    cleanup_summary["retained_days"],
+                    cleanup_summary["dialog_messages_deleted"],
+                    cleanup_summary["feedback_deleted"],
+                    cleanup_summary["analytics_events_deleted"],
+                    cleanup_summary["operator_handoffs_deleted"],
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Failed to cleanup manager logs")
+
+        await asyncio.sleep(MANAGER_LOG_CLEANUP_INTERVAL_SECONDS)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting WhatsApp webhook service...")
@@ -159,13 +187,19 @@ async def lifespan(app: FastAPI):
     )
     for admin_id in ADMIN_IDS:
         await create_admin(admin_id)
+
+    await cleanup_expired_manager_logs()
+
     handoff_timeout_task = asyncio.create_task(manager_handoff_timeout_worker())
+    manager_logs_cleanup_task = asyncio.create_task(manager_logs_cleanup_worker())
     try:
         yield
     finally:
         handoff_timeout_task.cancel()
+        manager_logs_cleanup_task.cancel()
         with suppress(asyncio.CancelledError):
             await handoff_timeout_task
+            await manager_logs_cleanup_task
         await close_db()
         await wazzup.close()
 
@@ -946,7 +980,7 @@ async def run_agent_and_reply(
     user_message: str | None,
     activity_version: int,
     system_message: str | None = None,
-) -> None:
+    ) -> None:
     conversation = await ensure_conversation(user)
 
     token_usage = await current_token_usage(user.id)
@@ -963,6 +997,12 @@ async def run_agent_and_reply(
         return
 
     exceeded = token_sum > LIMIT_PER_USER
+    if system_message:
+        system_message = system_message.strip()
+
+    warranty_msg = warranty_assessment_message(user_message or "") if user_message else None
+    if warranty_msg:
+        system_message = (system_message + "\n\n" if system_message else "") + warranty_msg
 
     result = await generate_response_serialized(
         user=user,

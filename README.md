@@ -13,7 +13,7 @@ pip install -r requirements.txt
 Required environment variables:
 
 ```bash
-DB_PATH=/Users/levineduard/HYPER/AIAgent-WA/data/database.db
+DATABASE_URL=postgresql://user:pass@127.0.0.1:5432/aiagent_wa
 WAZZUP_API_KEY=your_wazzup_api_key
 WAZZUP_CHANNEL_ID=your_wazzup_channel_id
 WAZZUP_CHAT_LINK_BASE=https://app.wazzup24.ru/your-account/chat/whatsapp/
@@ -56,9 +56,9 @@ MANAGER_WORKING_DAYS=0,1,2,3,4
 BITRIX_STAGE_STATUS_MAP={"C5:UC_SRW3R8":"Принят","C5:EXECUTING":"В работе","C5:FINAL_INVOICE":"Готов","C5:WON":"Выдан"}
 ```
 
-`ADMIN_IDS` is only an optional startup seed. Runtime admins are stored in the SQLite `admin` table and can be changed with `/newadmin` and `/deladmin`.
+`ADMIN_IDS` is only an optional startup seed. Runtime admins are stored in the Postgres `admin` table and can be changed with `/newadmin` and `/deladmin`.
 
-Admin-panel authentication uses only login/password accounts stored in the SQLite `admin_users` table. There are no environment-based bootstrap credentials; superadmins manage these accounts in `/admin/users`.
+Admin-panel authentication uses only login/password accounts stored in the Postgres `admin_users` table. There are no environment-based bootstrap credentials; superadmins manage these accounts in `/admin/users`.
 
 `ENABLE_CHAT_ALLOWLIST=1` makes the bot process inbound Wazzup messages only from `ALLOWED_CHAT_IDS`. Leave it unset/false for production traffic from all customers.
 
@@ -78,9 +78,9 @@ Inbound messages from any other WhatsApp number are ignored before the bot logs 
 Every distinct human outbound Wazzup message pauses the agent and resets the manager handoff timer. After `MANAGER_HANDOFF_TIMEOUT_MINUTES` without another manager message, the handoff closes and the agent processes future customer messages again. The default is 30 minutes; `MANAGER_HANDOFF_POLL_SECONDS` controls how often expired handoffs are checked.
 
 Manager handoff is available by default Monday-Friday from 10:00 to 19:00 Kazakhstan time. Outside those hours, the bot informs the customer that a manager will respond during working hours. If the customer explicitly insists on speaking to a manager, the LLM can call the handoff tool with `force=true`. Set `MANAGER_WORKING_HOURS_ENABLED=0` to allow handoff 24/7.
-On running environments, the same values are now editable from `/admin/settings` in the "Рабочие часы менеджера" block. Changes are applied immediately and persist in SQLite.
+On running environments, the same values are now editable from `/admin/settings` in the "Рабочие часы менеджера" block. Changes are applied immediately and persist in Postgres.
 
-`DB_PATH` must be a full SQLite file path. If unset, the app uses `./data/database.db`.
+`DATABASE_URL` must contain a valid PostgreSQL DSN. The app does not use local SQLite anymore.
 
 ## Running Locally
 
@@ -149,11 +149,10 @@ The built-in statuses are: `Принят`, `Диагностика`, `В раб�
 
 ## Persistent Data
 
-The app writes SQLite and received media under `DATA_DIR`.
+The app stores data in PostgreSQL (`DATABASE_URL`) and media in `DATA_DIR`.
 
 - Local default: `./data`
 - Docker default: `/data`
-- Database path: `DB_PATH`, or `${DATA_DIR}/database.db` when `DB_PATH` is unset
 - Media path: `${DATA_DIR}/media`
 
 In Docker, mount a host directory to `/data`:
@@ -167,7 +166,7 @@ docker run -d \
   samsonite-bot-wa
 ```
 
-This keeps `database.db` and received files outside the container.
+This keeps received files outside the container.
 
 ## HTTPS Webhook Domain
 

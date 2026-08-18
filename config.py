@@ -65,16 +65,23 @@ ALLOWED_CHAT_IDS = [
 
 STATIC_DIR = BASE_DIR / "static"
 AGENT_PROMPT_MAIN_PATH = STATIC_DIR / "agent_prompt_main.txt"
+WARRANTY_RULES_PATH = STATIC_DIR / "warranty_rules.txt"
 GREETING_TEXT_PATH = STATIC_DIR / "greeting.txt"
 PHOTO_PROCESSING_INSTRUCTIONS_PATH = Path(
     os.getenv("PHOTO_PROCESSING_INSTRUCTIONS_PATH") or STATIC_DIR / "photo_processing_instructions.txt"
 )
 PHOTO_PROCESSING_MODEL = os.getenv("PHOTO_PROCESSING_MODEL") or GPT_MODEL
 
+MANAGER_LOG_RETENTION_DAYS = int(os.getenv("MANAGER_LOG_RETENTION_DAYS") or 548)
+MANAGER_LOG_CLEANUP_INTERVAL_SECONDS = int(
+    os.getenv("MANAGER_LOG_CLEANUP_INTERVAL_SECONDS") or 3600 * 24,
+)
+
 DATA_DIR = Path(os.getenv("DATA_DIR") or BASE_DIR / "data").expanduser()
 DB_PATH = Path(os.getenv("DB_PATH") or DATA_DIR / "database.db").expanduser()
 DB_DIR = DB_PATH.parent
 MEDIA_DIR = Path(os.getenv("MEDIA_DIR") or DATA_DIR / "media")
+DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
 
 BITRIX_WEBHOOK_URL = os.getenv("BITRIX_WEBHOOK_URL")
 BITRIX_APPLICATION_TOKEN = (os.getenv("BITRIX_APPLICATION_TOKEN") or "").strip()

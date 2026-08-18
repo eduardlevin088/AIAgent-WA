@@ -1,7 +1,7 @@
 from openai import OpenAI
 from io import BytesIO
 from typing import Callable
-from config import GPT_KEY, GPT_MODEL, AGENT_PROMPT_MAIN_PATH
+from config import GPT_KEY, GPT_MODEL, AGENT_PROMPT_MAIN_PATH, WARRANTY_RULES_PATH
 from config import GPT_SPARE_MODEL, GPT_TRANSCRIPTION_MODEL
 from .miscellaneous import current_time_utc_offset, is_manager_working_time
 from .integrations import create_bitrix_lead, update_bitrix_repair_request_number
@@ -11,6 +11,13 @@ import asyncio
 
 with open(AGENT_PROMPT_MAIN_PATH, "r", encoding="utf-8") as f:
     agent_prompt_main = f.read()
+
+with open(WARRANTY_RULES_PATH, "r", encoding="utf-8") as f:
+    WARRANTY_RULES_TEXT = f.read().strip()
+
+agent_instructions = (
+    f"{agent_prompt_main}\n\nПравила гарантийного блока:\n{WARRANTY_RULES_TEXT}"
+)
 
 client = OpenAI(api_key=GPT_KEY)
 
@@ -128,7 +135,7 @@ def generate_response(user_message: str | None,
             "response_id": response.id if response else None
         }
 
-    instructions = f"{agent_prompt_main}\n\nCurrent time is {current_time}"
+    instructions = f"{agent_instructions}\n\nCurrent time is {current_time}"
     
     agent_input = []
     if user_message:
@@ -184,7 +191,7 @@ def generate_response(user_message: str | None,
 
                 response = client.responses.create(
                     model=model,
-                    instructions=agent_prompt_main,
+                    instructions=agent_instructions,
                     tools=tools,
                     input=agent_input,
                     conversation=conversation,
@@ -227,7 +234,7 @@ def generate_response(user_message: str | None,
 
                 response = client.responses.create(
                     model=model,
-                    instructions=agent_prompt_main,
+                    instructions=agent_instructions,
                     tools=tools,
                     input=agent_input,
                     conversation=conversation,
