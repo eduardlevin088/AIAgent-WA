@@ -48,6 +48,22 @@ class _CompatCursor:
         return rows
 
 
+class _CursorContext:
+    def __init__(self, cursor_awaitable):
+        self._cursor_awaitable = cursor_awaitable
+        self._cursor: _CompatCursor | None = None
+
+    def __await__(self):
+        return self._cursor_awaitable.__await__()
+
+    async def __aenter__(self):
+        self._cursor = await self._cursor_awaitable
+        return self._cursor
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
 def _normalize_sql(sql: str) -> str:
     had_insert_or_ignore = bool(_INSERT_OR_IGNORE_RE.match(sql))
     normalized = _INSERT_OR_IGNORE_RE.sub("INSERT INTO", sql.strip(), count=1)
@@ -87,6 +103,11 @@ class _AsyncDatabase:
     def __init__(self, pool: asyncpg.Pool):
         self._pool = pool
 
+    def execute(self, query: str, params: tuple | list | Sequence = ()) -> _CursorContext:
+        if params is None:
+            params = ()
+        return _CursorContext(self._execute(query, params))
+
     async def close(self) -> None:
         await self._pool.close()
 
@@ -96,9 +117,11 @@ class _AsyncDatabase:
     async def rollback(self) -> None:
         return None
 
-    async def execute(self, query: str, params: tuple | list | Sequence = ()) -> _CompatCursor:
-        if params is None:
-            params = ()
+    async def _execute(
+        self,
+        query: str,
+        params: tuple | list | Sequence = (),
+    ) -> _CompatCursor:
         normalized = _sqlite_to_pg(query)
         async with self._pool.acquire() as conn:
             upper = normalized.lstrip().upper()
