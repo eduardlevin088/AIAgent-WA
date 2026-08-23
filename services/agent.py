@@ -5,9 +5,8 @@ from config import GPT_KEY, GPT_MODEL, AGENT_PROMPT_MAIN_PATH, WARRANTY_RULES_PA
 from config import GPT_SPARE_MODEL, GPT_TRANSCRIPTION_MODEL
 from .miscellaneous import current_time_utc_offset, is_manager_working_time
 from .integrations import create_bitrix_lead, update_bitrix_repair_request_number
-from database import create_repair_request, get_bitrix_id, set_bitrix_id
+from database import create_repair_request, get_bitrix_id, set_bitrix_id, run_coro_on_db_loop
 import json
-import asyncio
 
 with open(AGENT_PROMPT_MAIN_PATH, "r", encoding="utf-8") as f:
     agent_prompt_main = f.read()
@@ -84,11 +83,11 @@ def transcribe(voice_buffer: BytesIO) -> str:
 
 
 def send_contact_details(data: dict, username: str, user_id: str) -> tuple[str, dict]:
-    bitrix_id = asyncio.run(get_bitrix_id(user_id))
+    bitrix_id = run_coro_on_db_loop(get_bitrix_id(user_id))
     result = create_bitrix_lead(data, username, bitrix_id)
-    
+
     data["deal_id"] = result["deal_id"]
-    request_number = asyncio.run(
+    request_number = run_coro_on_db_loop(
         create_repair_request(
             user_id=user_id,
             data=data,
@@ -101,7 +100,7 @@ def send_contact_details(data: dict, username: str, user_id: str) -> tuple[str, 
         update_bitrix_repair_request_number(result["deal_id"], request_number)
 
     if result["bitrix_id"]:
-        asyncio.run(set_bitrix_id(user_id, result["bitrix_id"]))
+        run_coro_on_db_loop(set_bitrix_id(user_id, result["bitrix_id"]))
     return f"Заявка создана в CRM. Номер заявки: {request_number}", data
 
 

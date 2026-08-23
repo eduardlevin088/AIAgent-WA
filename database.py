@@ -181,7 +181,22 @@ class _AsyncDatabase:
 
 
 db: Optional[_AsyncDatabase] = None
+_db_loop: Optional[asyncio.AbstractEventLoop] = None
 _handoff_operation_lock = asyncio.Lock()
+
+
+def run_coro_on_db_loop(coro):
+    """Run an async DB call from a worker thread (e.g. asyncio.to_thread).
+
+    The asyncpg pool is bound to the event loop it was created on
+    (the main FastAPI loop). Calling asyncio.run() from a different
+    thread spins up a *new* loop and hands the pool a connection tied
+    to the wrong loop, which asyncpg rejects. Route the coroutine back
+    onto the loop that owns the pool instead.
+    """
+    if _db_loop is None:
+        raise RuntimeError("Database not initialized")
+    return asyncio.run_coroutine_threadsafe(coro, _db_loop).result()
 
 DEFAULT_NOTIFICATION_TEMPLATES = (
     {
@@ -225,10 +240,11 @@ DEFAULT_NOTIFICATION_TEMPLATES = (
 
 
 async def init_db():
-    global db
+    global db, _db_loop
     try:
         if not DATABASE_URL:
             raise RuntimeError("DATABASE_URL is not configured")
+        _db_loop = asyncio.get_running_loop()
         pool = await asyncpg.create_pool(DATABASE_URL)
         db = _AsyncDatabase(pool)
         if db and not hasattr(db, "_compat_execute_wrapped"):
