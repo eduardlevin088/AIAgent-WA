@@ -7,6 +7,7 @@ from .miscellaneous import current_time_utc_offset, is_manager_working_time
 from .integrations import create_bitrix_lead, update_bitrix_repair_request_number
 from database import create_repair_request, get_bitrix_id, set_bitrix_id, run_coro_on_db_loop
 import json
+import logging
 
 with open(AGENT_PROMPT_MAIN_PATH, "r", encoding="utf-8") as f:
     agent_prompt_main = f.read()
@@ -18,7 +19,14 @@ agent_instructions = (
     f"{agent_prompt_main}\n\nПравила гарантийного блока:\n{WARRANTY_RULES_TEXT}"
 )
 
+logger = logging.getLogger(__name__)
+
 client = OpenAI(api_key=GPT_KEY)
+
+# Hard cap on chained tool rounds per turn. The final round is sent without
+# tools so the model cannot emit yet another function_call we would have to
+# answer -- every call is always answered before we return.
+MAX_TOOL_ROUNDS = 4
 
 
 tools = [
@@ -163,72 +171,86 @@ def generate_response(user_message: str | None,
     cache_tokens += usage.input_tokens_details.cached_tokens
     output_tokens += usage.output_tokens
 
-    function_call_items = [item for item in response.output if item.type == "function_call"]
+    def run_function_call(item) -> str:
+        nonlocal data_to_send, handoff
 
-    if function_call_items:
-        # The OpenAI-side `conversation` is stateful: once a function_call is
-        # in response.output it is already recorded there, and every future
-        # request on this conversation will be rejected with "No tool output
-        # found for function call ..." until it gets an output. So every
-        # function_call emitted here MUST be answered in the single follow-up
-        # request below, even when should_continue() turns false partway
-        # through (e.g. a newer message superseded this turn) -- in that case
-        # we still submit a placeholder output instead of abandoning it.
-        agent_input = []
+        if not can_continue():
+            return "Запрос отменён: клиент отправил новое сообщение."
 
-        for item in function_call_items:
-            cancelled = not can_continue()
-
+        try:
             if item.name == "send_contact_details":
-                if cancelled:
-                    func_response = "Запрос отменён: клиент отправил новое сообщение."
-                else:
-                    args = json.loads(item.arguments)
-                    args["model"] = args.get("model") or "Не указана"
-                    func_response, data_to_send = send_contact_details(data=args, username=username, user_id=user_id)
+                args = json.loads(item.arguments)
+                args["model"] = args.get("model") or "Не указана"
+                func_response, data_to_send = send_contact_details(
+                    data=args, username=username, user_id=user_id
+                )
+                return func_response
 
-                agent_input.append({
-                    "type": "function_call_output",
-                    "call_id": item.call_id,
-                    "output": json.dumps({
-                        "func_response": func_response
-                    })
-                })
-            elif item.name == "handoff_to_operator":
-                if cancelled:
-                    handoff_output = "Запрос отменён: клиент отправил новое сообщение."
-                else:
-                    args = json.loads(item.arguments)
-                    force = args.get("force") is True
-                    if force or is_manager_working_time():
-                        handoff = {
-                            "reason": args.get("reason", "Не указана"),
-                            "summary": args.get("summary", "Нет краткого описания"),
-                        }
-                        handoff_output = (
-                            "Диалог передан оператору. Клиенту нужно коротко сообщить, "
-                            "что менеджер подключится."
-                        )
-                    else:
-                        handoff_output = (
-                            "Сейчас менеджеры находятся вне рабочего времени. Передача не выполнена. "
-                            "Сообщи клиенту, что менеджер ответит в рабочее время. "
-                            "Если клиент явно настаивает на разговоре с менеджером, повторно вызови "
-                            "handoff_to_operator с force=true."
-                        )
+            if item.name == "handoff_to_operator":
+                args = json.loads(item.arguments)
+                force = args.get("force") is True
+                if force or is_manager_working_time():
+                    handoff = {
+                        "reason": args.get("reason", "Не указана"),
+                        "summary": args.get("summary", "Нет краткого описания"),
+                    }
+                    return (
+                        "Диалог передан оператору. Клиенту нужно коротко сообщить, "
+                        "что менеджер подключится."
+                    )
+                return (
+                    "Сейчас менеджеры находятся вне рабочего времени. Передача не выполнена. "
+                    "Сообщи клиенту, что менеджер ответит в рабочее время. "
+                    "Если клиент явно настаивает на разговоре с менеджером, повторно вызови "
+                    "handoff_to_operator с force=true."
+                )
 
-                agent_input.append({
-                    "type": "function_call_output",
-                    "call_id": item.call_id,
-                    "output": json.dumps({
-                        "func_response": handoff_output,
-                    }, ensure_ascii=False)
-                })
+            logger.error("Unknown function call requested by the model: %s", item.name)
+            return f"Неизвестная функция {item.name}. Ответь клиенту текстом."
+        except Exception as error:
+            # Never let a tool failure escape: the function_call is already
+            # recorded in the stateful conversation, so it MUST get an output
+            # or every future request on this conversation returns 400
+            # "No tool output found for function call ...".
+            logger.exception("Function call %s failed", item.name)
+            return (
+                f"Внутренняя ошибка при выполнении {item.name}: {error}. "
+                "Извинись перед клиентом и предложи повторить чуть позже "
+                "или передай диалог оператору."
+            )
+
+    # The OpenAI-side `conversation` is stateful: once a function_call is in
+    # response.output it is already recorded there, and every future request on
+    # this conversation is rejected with "No tool output found for function
+    # call ..." until it gets an output. So every function_call -- including
+    # ones emitted by the follow-up responses below -- must be answered before
+    # this function returns, even when should_continue() went false mid-turn.
+    for round_index in range(MAX_TOOL_ROUNDS):
+        function_call_items = [item for item in response.output if item.type == "function_call"]
+        if not function_call_items:
+            break
+
+        agent_input = [
+            {
+                "type": "function_call_output",
+                "call_id": item.call_id,
+                "output": json.dumps(
+                    {"func_response": run_function_call(item)}, ensure_ascii=False
+                ),
+            }
+            for item in function_call_items
+        ]
+
+        is_last_round = round_index == MAX_TOOL_ROUNDS - 1
+        if is_last_round:
+            logger.warning(
+                "Tool round limit reached for user %s; forcing a text-only reply", user_id
+            )
 
         response = client.responses.create(
             model=model,
             instructions=agent_instructions,
-            tools=tools,
+            tools=[] if is_last_round else tools,
             input=agent_input,
             conversation=conversation,
         )
