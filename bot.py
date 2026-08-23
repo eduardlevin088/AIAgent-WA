@@ -636,6 +636,30 @@ def is_openai_conversation_busy_error(error: Exception) -> bool:
     )
 
 
+def is_openai_missing_tool_output_error(error: Exception) -> bool:
+    return "no tool output found for function call" in str(error).lower()
+
+
+async def replace_poisoned_conversation(user: ChatUser) -> str:
+    """Start a fresh OpenAI conversation for the user.
+
+    Used when the persisted conversation has an unanswered function_call
+    (e.g. left over from a generation that was superseded mid tool-call),
+    which makes every future request on it fail with a 400 "no tool output
+    found for function call" error. Unlike reset_conversation(), this does
+    not greet the user or touch handoff/pause state -- it's a silent repair.
+    """
+    conversation = await new_conversation()
+    await create_or_update_user(
+        user_id=user.id,
+        username=user.username,
+        first_name=user.first_name,
+        last_name=user.last_name,
+        conversation=conversation,
+    )
+    return conversation
+
+
 async def generate_response_serialized(
     user: ChatUser,
     conversation: str,
@@ -682,6 +706,18 @@ async def generate_response_serialized(
                         f"attempt={attempt}; error={str(error)[:400]}",
                     )
                     await asyncio.sleep(GENERATION_BUSY_RETRY_DELAY_SECONDS * attempt)
+                    continue
+                if (
+                    attempt < GENERATION_BUSY_RETRY_ATTEMPTS
+                    and is_openai_missing_tool_output_error(error)
+                    and is_latest_activity_sync(user.id, activity_version)
+                ):
+                    await log_event(
+                        user.id,
+                        "openai_conversation_poisoned_reset",
+                        str(error)[:400],
+                    )
+                    conversation = await replace_poisoned_conversation(user)
                     continue
                 raise
 

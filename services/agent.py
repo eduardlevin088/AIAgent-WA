@@ -163,85 +163,79 @@ def generate_response(user_message: str | None,
     cache_tokens += usage.input_tokens_details.cached_tokens
     output_tokens += usage.output_tokens
 
-    for item in response.output:
-        if not can_continue():
-            break
+    function_call_items = [item for item in response.output if item.type == "function_call"]
 
-        if item.type == "function_call":
+    if function_call_items:
+        # The OpenAI-side `conversation` is stateful: once a function_call is
+        # in response.output it is already recorded there, and every future
+        # request on this conversation will be rejected with "No tool output
+        # found for function call ..." until it gets an output. So every
+        # function_call emitted here MUST be answered in the single follow-up
+        # request below, even when should_continue() turns false partway
+        # through (e.g. a newer message superseded this turn) -- in that case
+        # we still submit a placeholder output instead of abandoning it.
+        agent_input = []
+
+        for item in function_call_items:
+            cancelled = not can_continue()
+
             if item.name == "send_contact_details":
-                args = json.loads(item.arguments)
-                args["model"] = args.get("model") or "Не указана"
+                if cancelled:
+                    func_response = "Запрос отменён: клиент отправил новое сообщение."
+                else:
+                    args = json.loads(item.arguments)
+                    args["model"] = args.get("model") or "Не указана"
+                    func_response, data_to_send = send_contact_details(data=args, username=username, user_id=user_id)
 
-                if not can_continue():
-                    break
-
-                func_response, data_to_send = send_contact_details(data=args, username=username, user_id=user_id)
-
-                agent_input = [{
+                agent_input.append({
                     "type": "function_call_output",
                     "call_id": item.call_id,
                     "output": json.dumps({
                         "func_response": func_response
                     })
-                }]
-
-                if not can_continue():
-                    break
-
-                response = client.responses.create(
-                    model=model,
-                    instructions=agent_instructions,
-                    tools=tools,
-                    input=agent_input,
-                    conversation=conversation,
-                )
-
-                usage = response.usage
-                input_tokens += usage.input_tokens
-                cache_tokens += usage.input_tokens_details.cached_tokens
-                output_tokens += usage.output_tokens
+                })
             elif item.name == "handoff_to_operator":
-                args = json.loads(item.arguments)
-                force = args.get("force") is True
-                if force or is_manager_working_time():
-                    handoff = {
-                        "reason": args.get("reason", "Не указана"),
-                        "summary": args.get("summary", "Нет краткого описания"),
-                    }
-                    handoff_output = (
-                        "Диалог передан оператору. Клиенту нужно коротко сообщить, "
-                        "что менеджер подключится."
-                    )
+                if cancelled:
+                    handoff_output = "Запрос отменён: клиент отправил новое сообщение."
                 else:
-                    handoff_output = (
-                        "Сейчас менеджеры находятся вне рабочего времени. Передача не выполнена. "
-                        "Сообщи клиенту, что менеджер ответит в рабочее время. "
-                        "Если клиент явно настаивает на разговоре с менеджером, повторно вызови "
-                        "handoff_to_operator с force=true."
-                    )
+                    args = json.loads(item.arguments)
+                    force = args.get("force") is True
+                    if force or is_manager_working_time():
+                        handoff = {
+                            "reason": args.get("reason", "Не указана"),
+                            "summary": args.get("summary", "Нет краткого описания"),
+                        }
+                        handoff_output = (
+                            "Диалог передан оператору. Клиенту нужно коротко сообщить, "
+                            "что менеджер подключится."
+                        )
+                    else:
+                        handoff_output = (
+                            "Сейчас менеджеры находятся вне рабочего времени. Передача не выполнена. "
+                            "Сообщи клиенту, что менеджер ответит в рабочее время. "
+                            "Если клиент явно настаивает на разговоре с менеджером, повторно вызови "
+                            "handoff_to_operator с force=true."
+                        )
 
-                agent_input = [{
+                agent_input.append({
                     "type": "function_call_output",
                     "call_id": item.call_id,
                     "output": json.dumps({
                         "func_response": handoff_output,
                     }, ensure_ascii=False)
-                }]
+                })
 
-                if not can_continue():
-                    break
+        response = client.responses.create(
+            model=model,
+            instructions=agent_instructions,
+            tools=tools,
+            input=agent_input,
+            conversation=conversation,
+        )
 
-                response = client.responses.create(
-                    model=model,
-                    instructions=agent_instructions,
-                    tools=tools,
-                    input=agent_input,
-                    conversation=conversation,
-                )
-
-                usage = response.usage
-                input_tokens += usage.input_tokens
-                cache_tokens += usage.input_tokens_details.cached_tokens
-                output_tokens += usage.output_tokens
+        usage = response.usage
+        input_tokens += usage.input_tokens
+        cache_tokens += usage.input_tokens_details.cached_tokens
+        output_tokens += usage.output_tokens
 
     return result_payload()
