@@ -36,6 +36,7 @@ from database import get_manager_working_hours_settings, set_manager_working_hou
 from database import get_admin_user_by_id, get_admin_user_by_username, get_customer_segment
 from database import get_analytics_summary, get_handoff_recipient_ids
 from database import get_notification_template_text, get_repair_request_group_stats
+from database import get_latest_repair_request
 from database import get_media_files, get_operator_handoff_stats, get_recent_dialog
 from database import get_repair_request_stats
 from database import get_token_usage, get_user_conversation, get_users, init_db
@@ -941,14 +942,112 @@ async def notify_handoff_recipients(
             logger.exception("Failed to send handoff to admin user %s", recipient_id)
 
 
-def format_recent_dialog(dialog: list[dict[str, Any]]) -> str:
+HANDOFF_DIALOG_MESSAGES = 6
+HANDOFF_DIALOG_MESSAGE_CHARS = 220
+
+ROLE_LABELS = {
+    "user": "Клиент",
+    "assistant": "Бот",
+    "system": "Система",
+}
+
+# Placeholders the model falls back to when it has nothing concrete to say --
+# printing them as facts would be exactly the noise the card is meant to remove.
+HANDOFF_FILLER_VALUES = {
+    "none",
+    "не указана",
+    "не указано",
+    "не указан",
+    "нет краткого описания",
+    "нет данных",
+    "-",
+}
+
+
+def format_handoff_dialog_tail(dialog: list[dict[str, Any]]) -> str:
+    """Render the last few customer/bot turns in a form a manager can skim."""
     lines = []
-    for item in dialog:
-        text = item.get("text") or ""
-        if len(text) > 500:
-            text = text[:497] + "..."
-        lines.append(f"{item['created_at']} {item['role']} ({item['message_type']}): {text}")
+    for item in dialog[-HANDOFF_DIALOG_MESSAGES:]:
+        text = (item.get("text") or "").strip()
+        message_type = item.get("message_type") or "text"
+        if not text:
+            text = f"[{message_type}]"
+        elif message_type not in {"text", None}:
+            text = f"[{message_type}] {text}"
+        text = " ".join(text.split())
+        if len(text) > HANDOFF_DIALOG_MESSAGE_CHARS:
+            text = text[:HANDOFF_DIALOG_MESSAGE_CHARS - 3] + "..."
+        role = ROLE_LABELS.get(item.get("role"), item.get("role") or "?")
+        lines.append(f"{role}: {text}")
     return "\n".join(lines) or "История пуста"
+
+
+def format_handoff_card(
+    user: ChatUser,
+    handoff: dict[str, Any],
+    handoff_record: dict[str, Any],
+    request: dict[str, Any] | None,
+    dialog: list[dict[str, Any]],
+) -> str:
+    request = request or {}
+
+    def clean(value: Any) -> str:
+        text = str(value).strip() if value is not None else ""
+        return text if text and text.lower() not in HANDOFF_FILLER_VALUES else ""
+
+    client_name = clean(request.get("name")) or clean(user.first_name) or clean(user.username)
+    phone = clean(request.get("phone")) or clean(user.id)
+    device = " ".join(part for part in (
+        clean(request.get("product_type")),
+        clean(request.get("brand")),
+        clean(request.get("model")),
+    ) if part)
+
+    lines = [
+        f"Нужен оператор · передача #{handoff_record.get('id')}",
+        "",
+        f"Клиент: {', '.join(part for part in (client_name, phone) if part) or user.id}",
+    ]
+
+    city = clean(request.get("city"))
+    if city:
+        lines.append(f"Город: {city}")
+
+    request_number = request.get("request_number")
+    if request_number:
+        status = clean(request.get("status"))
+        lines.append(f"Заявка: #{request_number}{f' ({status})' if status else ''}")
+    else:
+        lines.append("Заявка: не оформлена")
+
+    if device:
+        lines.append(f"Техника: {device}")
+    problem = clean(request.get("problem"))
+    if problem:
+        lines.append(f"Проблема: {problem}")
+
+    client_question = clean(handoff.get("client_question"))
+    if client_question:
+        lines += ["", "Вопрос клиента:", f"«{client_question}»"]
+
+    requested_action = clean(handoff.get("requested_action"))
+    if requested_action:
+        lines += ["", f"Что нужно от менеджера: {requested_action}"]
+
+    reason = clean(handoff.get("reason"))
+    if reason:
+        lines.append(f"Причина передачи: {reason}")
+
+    summary = clean(handoff.get("summary"))
+    if summary and summary != client_question:
+        lines.append(f"Контекст: {summary}")
+
+    bot_already_did = clean(handoff.get("bot_already_did"))
+    if bot_already_did:
+        lines.append(f"Бот уже: {bot_already_did}")
+
+    lines += ["", "— Последние сообщения —", format_handoff_dialog_tail(dialog)]
+    return "\n".join(lines)
 
 
 async def handle_handoff(
@@ -972,17 +1071,14 @@ async def handle_handoff(
         }, ensure_ascii=False),
     )
 
-    dialog = await get_recent_dialog(user.id, limit=20)
-    admin_text = (
-        "Требуется оператор.\n\n"
-        f"Передача: #{handoff_record.get('id')}\n"
-        f"Клиент: {user.first_name or user.username}\n"
-        f"WhatsApp: {user.id}\n"
-        f"Причина: {handoff.get('reason')}\n"
-        f"Кратко: {handoff.get('summary')}\n\n"
-        "Последние сообщения:\n"
-        f"{format_recent_dialog(dialog)}"
-    )
+    dialog = await get_recent_dialog(user.id, limit=HANDOFF_DIALOG_MESSAGES)
+    try:
+        request = await get_latest_repair_request(user.id)
+    except Exception:
+        logger.exception("Failed to load repair request card for handoff %s", user.id)
+        request = None
+
+    admin_text = format_handoff_card(user, handoff, handoff_record, request, dialog)
     await notify_handoff_recipients(admin_text, channel_id, chat_type)
 
 

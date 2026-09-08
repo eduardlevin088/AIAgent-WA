@@ -1721,6 +1721,26 @@ REPAIR_REQUEST_STATUSES = (
 )
 
 
+async def get_latest_repair_request(user_id: str) -> dict | None:
+    """Return the most recent repair request of a customer, for the operator card."""
+    if db is None:
+        raise RuntimeError("Database not initialized")
+
+    async with db.execute("""
+        SELECT
+            request_number, status, service_type, name, phone, city,
+            product_type, brand, model, problem, diagnostic_summary,
+            estimated_price_range, warranty_context, convenient_time, created_at
+        FROM repair_requests
+        WHERE user_id = ?
+        ORDER BY id DESC
+        LIMIT 1
+    """, (user_id,)) as cursor:
+        row = await cursor.fetchone()
+
+    return dict(row) if row else None
+
+
 async def list_repair_requests(
     status: str | None = None,
     q: str | None = None,

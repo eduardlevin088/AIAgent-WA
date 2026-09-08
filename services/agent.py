@@ -65,15 +65,42 @@ tools = [
         "parameters": {
             "type": "object",
             "properties": {
-                "reason": {"type": "string"},
-                "summary": {"type": "string"},
+                "reason": {
+                    "type": "string",
+                    "description": "Short category of the handoff, e.g. 'наличие запчасти', 'претензия', 'клиент просит человека'.",
+                },
+                "summary": {
+                    "type": "string",
+                    "description": (
+                        "1-2 sentences of concrete context the manager needs: what the customer "
+                        "wants, which device and problem it concerns. No generic wording."
+                    ),
+                },
+                "client_question": {
+                    "type": "string",
+                    "description": (
+                        "The customer's actual question or demand, quoted or closely paraphrased "
+                        "in their own words."
+                    ),
+                },
+                "requested_action": {
+                    "type": "string",
+                    "description": "What exactly the manager has to do or find out to close this question.",
+                },
+                "bot_already_did": {
+                    "type": "string",
+                    "description": (
+                        "What has already been told or done in the chat, so the manager does not "
+                        "repeat it. Empty string if nothing relevant."
+                    ),
+                },
                 "force": {
                     "type": "boolean",
                     "description": "Set true only when the customer explicitly insists on a manager outside working hours.",
                     "default": False,
                 },
             },
-            "required": ["reason", "summary"]
+            "required": ["reason", "summary", "client_question", "requested_action"]
         },
     },
 ]
@@ -193,6 +220,9 @@ def generate_response(user_message: str | None,
                     handoff = {
                         "reason": args.get("reason", "Не указана"),
                         "summary": args.get("summary", "Нет краткого описания"),
+                        "client_question": args.get("client_question"),
+                        "requested_action": args.get("requested_action"),
+                        "bot_already_did": args.get("bot_already_did"),
                     }
                     return (
                         "Диалог передан оператору. Клиенту нужно коротко сообщить, "
