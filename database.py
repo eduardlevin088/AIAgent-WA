@@ -12,6 +12,7 @@ from config import MANAGER_WORKING_DAYS, MANAGER_WORKING_HOURS_ENABLED
 from config import MANAGER_WORKING_HOURS_END, MANAGER_WORKING_HOURS_START
 from config import MANAGER_LOG_RETENTION_DAYS
 from prettytable import PrettyTable
+from services.integrations import segment_phone_key
 
 
 logger = logging.getLogger(__name__)
@@ -529,11 +530,13 @@ async def create_tables():
             contact_count INTEGER NOT NULL DEFAULT 0,
             deal_count INTEGER NOT NULL DEFAULT 0,
             max_phone_count INTEGER NOT NULL DEFAULT 0,
+            excluded_phone_count INTEGER NOT NULL DEFAULT 0,
             error TEXT,
             created_by INTEGER,
             created_at TIMESTAMPTZ DEFAULT NOW(),
             started_at TIMESTAMP,
             completed_at TIMESTAMP,
+            used_at TIMESTAMP,
             updated_at TIMESTAMPTZ DEFAULT NOW()
         )
     """)
@@ -550,6 +553,13 @@ async def create_tables():
         "max_phone_count",
         "max_phone_count INTEGER NOT NULL DEFAULT 0",
     )
+    await ensure_column(
+        "customer_segments",
+        "excluded_phone_count",
+        "excluded_phone_count INTEGER NOT NULL DEFAULT 0",
+    )
+    ledger_is_new = not await column_exists("customer_segments", "used_at")
+    await ensure_column("customer_segments", "used_at", "used_at TIMESTAMP")
     await ensure_column("customer_segments", "error", "error TEXT")
     await ensure_column("customer_segments", "created_by", "created_by INTEGER")
     await ensure_column("customer_segments", "started_at", "started_at TIMESTAMP")
@@ -563,13 +573,33 @@ async def create_tables():
         CREATE INDEX IF NOT EXISTS idx_customer_segments_created_at
         ON customer_segments (created_at DESC)
     """)
+
+    # Phones already handed out to operators. A number lands here when its
+    # segment is marked as used and is skipped by every later collection.
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS used_segment_phones (
+            segment_id INTEGER NOT NULL,
+            phone TEXT NOT NULL,
+            used_at TIMESTAMPTZ DEFAULT NOW(),
+            PRIMARY KEY (segment_id, phone)
+        )
+    """)
+    await db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_used_segment_phones_phone
+        ON used_segment_phones (phone)
+    """)
+
+    if ledger_is_new:
+        # Segments collected before the ledger existed were already handed out,
+        # so seed them once instead of letting their numbers be collected again.
+        await backfill_used_segment_phones()
     
     logger.info("Database tables created successfully")
 
     await db.commit()
 
 
-async def ensure_column(table: str, column: str, definition: str):
+async def column_exists(table: str, column: str) -> bool:
     if db is None:
         raise RuntimeError("Database not initialized")
 
@@ -584,8 +614,14 @@ async def ensure_column(table: str, column: str, definition: str):
     ) as cursor:
         rows = await cursor.fetchall()
 
-    columns = {row["column_name"] for row in rows}
-    if column not in columns:
+    return column in {row["column_name"] for row in rows}
+
+
+async def ensure_column(table: str, column: str, definition: str):
+    if db is None:
+        raise RuntimeError("Database not initialized")
+
+    if not await column_exists(table, column):
         await db.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
 
 
@@ -2038,6 +2074,7 @@ async def complete_customer_segment_job(segment_id: int, result: dict) -> None:
             phone_count = ?,
             contact_count = ?,
             deal_count = ?,
+            excluded_phone_count = ?,
             max_phone_count = COALESCE(max_phone_count, 0),
             error = NULL,
             completed_at = NOW(),
@@ -2049,6 +2086,7 @@ async def complete_customer_segment_job(segment_id: int, result: dict) -> None:
         int(result.get("unique_phones") or 0),
         int(result.get("unique_contacts") or 0),
         int(result.get("total_deals") or 0),
+        int(result.get("excluded_phones") or 0),
         segment_id,
     ))
     await db.commit()
@@ -2080,6 +2118,7 @@ def _segment_row_to_dict(row) -> dict:
     except json.JSONDecodeError:
         item["stage_rows"] = []
     item["can_download"] = item.get("status") == "completed" and bool(item.get("phone_text"))
+    item["is_used"] = bool(item.get("used_at"))
     return item
 
 
@@ -2091,8 +2130,8 @@ async def list_customer_segments(limit: int = 20) -> list[dict]:
         SELECT
             id, name, status, selections_json, stage_rows_json, phone_text,
             phone_count, contact_count, deal_count, error, created_by,
-            max_phone_count,
-            created_at, started_at, completed_at, updated_at
+            max_phone_count, excluded_phone_count,
+            created_at, started_at, completed_at, used_at, updated_at
         FROM customer_segments
         ORDER BY created_at DESC, id DESC
         LIMIT ?
@@ -2109,13 +2148,126 @@ async def get_customer_segment(segment_id: int) -> dict | None:
         SELECT
             id, name, status, selections_json, stage_rows_json, phone_text,
             phone_count, contact_count, deal_count, error, created_by,
-            max_phone_count,
-            created_at, started_at, completed_at, updated_at
+            max_phone_count, excluded_phone_count,
+            created_at, started_at, completed_at, used_at, updated_at
         FROM customer_segments
         WHERE id = ?
     """, (segment_id,)) as cursor:
         row = await cursor.fetchone()
     return _segment_row_to_dict(row) if row else None
+
+
+def _phone_keys_from_text(phone_text: str | None) -> list[str]:
+    keys = {
+        key
+        for key in (segment_phone_key(line) for line in (phone_text or "").splitlines())
+        if key
+    }
+    return sorted(keys)
+
+
+async def get_used_segment_phones() -> set[str]:
+    """Phones already handed out by a segment that was marked as used."""
+    if db is None:
+        raise RuntimeError("Database not initialized")
+
+    async with db.execute("SELECT DISTINCT phone FROM used_segment_phones") as cursor:
+        rows = await cursor.fetchall()
+    return {row["phone"] for row in rows}
+
+
+async def mark_customer_segment_used(segment_id: int) -> dict | None:
+    """Record a completed segment's phones so later collections skip them.
+
+    Idempotent: re-marking an already used segment keeps the original
+    ``used_at`` and adds nothing new to the ledger.
+    """
+    if db is None:
+        raise RuntimeError("Database not initialized")
+
+    segment = await get_customer_segment(segment_id)
+    if not segment or segment.get("status") != "completed":
+        return None
+
+    phones = _phone_keys_from_text(segment.get("phone_text"))
+    for chunk_start in range(0, len(phones), 500):
+        chunk = phones[chunk_start:chunk_start + 500]
+        placeholders = ", ".join(["(?, ?)"] * len(chunk))
+        params: list = []
+        for phone in chunk:
+            params.extend((segment_id, phone))
+        await db.execute(
+            f"""
+            INSERT INTO used_segment_phones (segment_id, phone)
+            VALUES {placeholders}
+            ON CONFLICT DO NOTHING
+            """,
+            params,
+        )
+
+    await db.execute("""
+        UPDATE customer_segments
+        SET used_at = COALESCE(used_at, NOW()),
+            updated_at = NOW()
+        WHERE id = ?
+    """, (segment_id,))
+    await db.commit()
+    return await get_customer_segment(segment_id)
+
+
+async def release_customer_segment_phones(segment_id: int) -> dict | None:
+    """Return a segment's phones to the pool so they can be collected again.
+
+    Numbers that another used segment also contains stay excluded, because the
+    ledger keeps one row per (segment, phone).
+    """
+    if db is None:
+        raise RuntimeError("Database not initialized")
+
+    segment = await get_customer_segment(segment_id)
+    if not segment:
+        return None
+
+    await db.execute(
+        "DELETE FROM used_segment_phones WHERE segment_id = ?",
+        (segment_id,),
+    )
+    await db.execute("""
+        UPDATE customer_segments
+        SET used_at = NULL,
+            updated_at = NOW()
+        WHERE id = ?
+    """, (segment_id,))
+    await db.commit()
+    return await get_customer_segment(segment_id)
+
+
+async def backfill_used_segment_phones() -> int:
+    """Seed the ledger from segments collected before it existed.
+
+    Runs once, when the ``used_at`` column is first added. Operators can undo it
+    for any individual segment with release_customer_segment_phones().
+    """
+    if db is None:
+        raise RuntimeError("Database not initialized")
+
+    async with db.execute("""
+        SELECT id
+        FROM customer_segments
+        WHERE status = 'completed'
+          AND phone_text IS NOT NULL
+          AND phone_text <> ''
+        ORDER BY id
+    """) as cursor:
+        rows = await cursor.fetchall()
+
+    seeded = 0
+    for row in rows:
+        if await mark_customer_segment_used(int(row["id"])):
+            seeded += 1
+    if seeded:
+        logger.info("Seeded used-phone ledger from %s existing segments", seeded)
+    return seeded
 
 
 async def update_repair_request_status_by_deal_id(deal_id: int, status: str) -> int:

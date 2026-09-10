@@ -39,11 +39,13 @@ from database import get_notification_template_text, get_repair_request_group_st
 from database import get_latest_repair_request
 from database import get_media_files, get_operator_handoff_stats, get_recent_dialog
 from database import get_repair_request_stats
-from database import get_token_usage, get_user_conversation, get_users, init_db
+from database import get_token_usage, get_used_segment_phones, get_user_conversation
+from database import get_users, init_db
 from database import is_bot_paused, list_admin_users, list_customers, list_repair_requests
 from database import list_customer_segments, list_notification_templates
 from database import log_event, mark_message_processed
-from database import mark_customer_segment_running, record_operator_message
+from database import mark_customer_segment_running, mark_customer_segment_used
+from database import record_operator_message, release_customer_segment_phones
 from database import cleanup_expired_manager_logs
 from database import REPAIR_REQUEST_STATUSES, save_feedback
 from database import save_media_file, set_bot_paused, set_handoff_recipients
@@ -1922,10 +1924,12 @@ async def collect_customer_segment_background(
 ) -> None:
     await mark_customer_segment_running(segment_id)
     try:
+        excluded_phones = await get_used_segment_phones()
         result = await asyncio.to_thread(
             build_bitrix_customer_segment,
             selections,
             max_phone_count,
+            excluded_phones,
         )
     except Exception as exc:
         logger.exception("Failed to collect customer segment %s", segment_id)
@@ -1943,10 +1947,48 @@ async def collect_customer_segment_background(
                 "contact_count": result.get("unique_contacts"),
                 "deal_count": result.get("total_deals"),
                 "phone_limit": result.get("requested_phone_count_limit"),
+                "excluded_phones": result.get("excluded_phones"),
             },
             ensure_ascii=False,
         ),
     )
+
+
+async def mark_segment_used(
+    segment: dict[str, Any],
+    admin: dict[str, Any],
+    *,
+    source: str,
+) -> None:
+    """Move a segment's phones into the used ledger so they are never re-collected."""
+    if segment.get("is_used") or segment.get("status") != "completed":
+        return
+
+    updated = await mark_customer_segment_used(int(segment["id"]))
+    if not updated:
+        return
+
+    await log_event(
+        None,
+        "customer_segment_used",
+        json.dumps(
+            {
+                "segment_id": int(segment["id"]),
+                "admin_id": admin.get("id"),
+                "admin_username": admin.get("username"),
+                "phone_count": updated.get("phone_count"),
+                "source": source,
+            },
+            ensure_ascii=False,
+        ),
+    )
+
+
+def segment_action_response(request: Request) -> Response:
+    """Answer segment actions in place for fetch() and with a redirect for forms."""
+    if request.headers.get("x-requested-with") == "fetch":
+        return Response(status_code=204)
+    return RedirectResponse("/admin/segments/stages", status_code=303)
 
 
 async def render_admin_segments(
@@ -2208,12 +2250,57 @@ async def admin_segment_download(request: Request, segment_id: int) -> Response:
     if segment.get("status") != "completed":
         raise HTTPException(status_code=409, detail="Segment is not completed")
 
+    await mark_segment_used(segment, admin, source="download")
+
     filename = quote(f"{segment['name']}.txt")
     return Response(
         segment.get("phone_text") or "",
         media_type="text/plain; charset=utf-8",
         headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"},
     )
+
+
+@app.post("/admin/segments/{segment_id}/used")
+async def admin_segment_mark_used(request: Request, segment_id: int) -> Response:
+    admin = await current_admin(request)
+    if not admin:
+        return RedirectResponse("/admin/login", status_code=303)
+
+    segment = await get_customer_segment(segment_id)
+    if not segment:
+        raise HTTPException(status_code=404, detail="Segment not found")
+    if segment.get("status") != "completed":
+        raise HTTPException(status_code=409, detail="Segment is not completed")
+
+    form = await parse_urlencoded_form(request)
+    await mark_segment_used(segment, admin, source=form.get("source") or "manual")
+    return segment_action_response(request)
+
+
+@app.post("/admin/segments/{segment_id}/release")
+async def admin_segment_release(request: Request, segment_id: int) -> Response:
+    admin = await current_admin(request)
+    if not admin:
+        return RedirectResponse("/admin/login", status_code=303)
+
+    segment = await release_customer_segment_phones(segment_id)
+    if not segment:
+        raise HTTPException(status_code=404, detail="Segment not found")
+
+    await log_event(
+        None,
+        "customer_segment_released",
+        json.dumps(
+            {
+                "segment_id": segment_id,
+                "admin_id": admin.get("id"),
+                "admin_username": admin.get("username"),
+                "phone_count": segment.get("phone_count"),
+            },
+            ensure_ascii=False,
+        ),
+    )
+    return segment_action_response(request)
 
 
 @app.get("/admin/payments", response_class=HTMLResponse)

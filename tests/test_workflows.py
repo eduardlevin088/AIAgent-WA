@@ -782,6 +782,111 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(segment["can_download"])
         self.assertEqual(segments[0]["id"], segment_id)
 
+    async def test_customer_segment_skips_phones_from_used_segments(self):
+        original_webhook_url = integrations.BITRIX_WEBHOOK_URL
+        integrations.BITRIX_WEBHOOK_URL = "https://bitrix.example/rest/1/token/"
+
+        contacts = {301: "+77070000001", 302: "+77070000002", 303: "+77070000003"}
+
+        def response(payload: dict) -> Mock:
+            mocked_response = Mock()
+            mocked_response.raise_for_status = Mock()
+            mocked_response.json.return_value = payload
+            return mocked_response
+
+        def fake_post(url: str, json: dict, timeout: int = 30):
+            method = url.rstrip("/").split("/")[-1]
+            if method == "crm.item.list":
+                return response({
+                    "result": {
+                        "items": [{"contactIds": [contact_id]} for contact_id in contacts],
+                        "total": len(contacts),
+                    },
+                })
+            if method == "crm.item.get":
+                contact_id = json["id"]
+                return response({
+                    "result": {"item": {"id": contact_id, "phone": contacts[contact_id]}}
+                })
+            raise AssertionError(f"Unexpected Bitrix call: {method} {json}")
+
+        selections = [
+            {
+                "category_id": 5,
+                "category_name": "Online Deals",
+                "stage_id": "C5:WON",
+                "stage_name": "WON",
+            }
+        ]
+
+        try:
+            with unittest.mock.patch.object(integrations.requests, "post", side_effect=fake_post):
+                first = await asyncio.to_thread(
+                    integrations.build_bitrix_customer_segment,
+                    selections,
+                    2,
+                )
+                second = await asyncio.to_thread(
+                    integrations.build_bitrix_customer_segment,
+                    selections,
+                    2,
+                    set(first["phones"]),
+                )
+        finally:
+            integrations.BITRIX_WEBHOOK_URL = original_webhook_url
+
+        # The limit is filled with fresh numbers instead of repeating the first run.
+        self.assertEqual(first["phones"], ["+77070000001", "+77070000002"])
+        self.assertEqual(first["excluded_phones"], 0)
+        self.assertEqual(second["phones"], ["+77070000003"])
+        self.assertEqual(second["excluded_phones"], 2)
+
+    async def test_marking_segment_used_excludes_phones_until_released(self):
+        async def completed_segment(name: str, phone_text: str) -> int:
+            segment_id = await database.create_customer_segment_job(
+                name,
+                [{"category_id": 5, "stage_id": "C5:WON"}],
+                None,
+                1,
+            )
+            await database.complete_customer_segment_job(
+                segment_id,
+                {
+                    "stage_rows": [],
+                    "phone_text": phone_text,
+                    "unique_phones": len(phone_text.splitlines()),
+                    "unique_contacts": 1,
+                    "total_deals": 1,
+                },
+            )
+            return segment_id
+
+        first_id = await completed_segment("Сегмент A", "+77070000001\n+77070000002")
+        second_id = await completed_segment("Сегмент B", "+77070000002\n+77070000003")
+
+        self.assertEqual(await database.get_used_segment_phones(), set())
+
+        marked = await database.mark_customer_segment_used(first_id)
+        self.assertTrue(marked["is_used"])
+        self.assertEqual(
+            await database.get_used_segment_phones(),
+            {"77070000001", "77070000002"},
+        )
+
+        # Marking twice keeps the original timestamp and adds nothing new.
+        remarked = await database.mark_customer_segment_used(first_id)
+        self.assertEqual(remarked["used_at"], marked["used_at"])
+
+        await database.mark_customer_segment_used(second_id)
+        released = await database.release_customer_segment_phones(first_id)
+
+        self.assertFalse(released["is_used"])
+        # 77070000002 stays excluded because the second segment still holds it.
+        self.assertEqual(
+            await database.get_used_segment_phones(),
+            {"77070000002", "77070000003"},
+        )
+
     async def test_handoff_settings_show_only_recipient_names(self):
         html = bot.templates.env.get_template("admin_settings.html").render(
             admin={"username": "owner", "role": "superadmin"},

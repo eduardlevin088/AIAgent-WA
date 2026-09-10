@@ -260,6 +260,27 @@
         font-size: 22px;
     }
 
+    .reuse-note {
+        margin: 0 0 16px;
+        padding: 12px 14px;
+        color: var(--muted);
+        background: var(--surface-strong);
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        font-size: 13px;
+    }
+
+    .status-used {
+        color: #4a3a6b;
+        background: #ece6f7;
+        border: 1px solid #cfc2e8;
+    }
+
+    .phone-count-cell strong {
+        display: block;
+        font-size: 16px;
+    }
+
     .hidden-copy-source {
         position: absolute;
         left: -9999px;
@@ -303,6 +324,8 @@
                 Фильтр по этапам CRM
             </div>
         </section>
+
+        <p class="reuse-note">Номера из ранее использованных сегментов не собираются повторно. Исключение применяется до лимита, поэтому лимит всегда заполняется новыми номерами.</p>
 
         {% if error %}
             <div class="error" style="margin-bottom: 16px;">{{ error }}</div>
@@ -415,15 +438,34 @@
                                             В очереди
                                         {% endif %}
                                     </span>
+                                    {% if segment.is_used %}
+                                        <div style="margin-top: 6px;">
+                                            <span class="status-pill status-used">Использован</span>
+                                        </div>
+                                    {% endif %}
                                 </td>
-                                <td>{{ segment.phone_count }}</td>
+                                <td class="phone-count-cell">
+                                    <strong>{{ segment.phone_count }}</strong>
+                                    {% if segment.excluded_phone_count %}
+                                        <span class="muted">исключено ранее использованных: {{ segment.excluded_phone_count }}</span>
+                                    {% endif %}
+                                </td>
                                 <td>{{ segment.deal_count }}</td>
                                 <td>{{ segment.created_at }}</td>
                                 <td>
                                     {% if segment.can_download %}
                                         <div class="actions-row">
                                             <a class="button secondary" href="/admin/segments/{{ segment.id }}/download.txt">Скачать</a>
-                                            <button class="secondary copy-segment" type="button" data-copy-target="segment-phones-{{ segment.id }}">Копировать</button>
+                                            <button class="secondary copy-segment" type="button" data-copy-target="segment-phones-{{ segment.id }}" data-segment-id="{{ segment.id }}">Копировать</button>
+                                            {% if segment.is_used %}
+                                                <form method="post" action="/admin/segments/{{ segment.id }}/release">
+                                                    <button class="secondary" type="submit">Вернуть в пул</button>
+                                                </form>
+                                            {% else %}
+                                                <form method="post" action="/admin/segments/{{ segment.id }}/used">
+                                                    <button class="secondary" type="submit">Отметить использованным</button>
+                                                </form>
+                                            {% endif %}
                                         </div>
                                         <textarea id="segment-phones-{{ segment.id }}" class="hidden-copy-source" readonly>{{ segment.phone_text }}</textarea>
                                     {% else %}
@@ -453,11 +495,22 @@
                 target.select();
                 document.execCommand("copy");
             }
-            const original = button.textContent;
             button.textContent = "Скопировано";
+            try {
+                await fetch(`/admin/segments/${button.dataset.segmentId}/used`, {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "X-Requested-With": "fetch",
+                    },
+                    body: "source=copy",
+                });
+            } catch (error) {
+                // Marking is best-effort here; the operator can still do it by hand.
+            }
             window.setTimeout(() => {
-                button.textContent = original;
-            }, 1400);
+                window.location.reload();
+            }, 1200);
         });
     });
 

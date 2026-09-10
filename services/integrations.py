@@ -185,6 +185,15 @@ def _normalize_phone(phone: object) -> str | None:
     return None
 
 
+def segment_phone_key(phone: object) -> str | None:
+    """Canonical ledger key for a phone: bare digits, e.g. 77071234567.
+
+    Accepts anything a segment ever stored or displayed (+7..., 8..., raw
+    Bitrix values) so the collected-phones ledger stays comparable over time.
+    """
+    return _normalize_phone(phone)
+
+
 def _to_e164_like(phone: str | None) -> str | None:
     if not phone:
         return None
@@ -225,7 +234,20 @@ def get_bitrix_contact_phones(contact_id: int) -> list[str]:
 def build_bitrix_customer_segment(
     selections: list[dict],
     max_phone_count: int | None = None,
+    excluded_phones: set[str] | None = None,
 ) -> dict:
+    """Collect phones for the selected funnel stages.
+
+    Phones listed in ``excluded_phones`` (numbers already handed out by an
+    earlier segment) are dropped *before* ``max_phone_count`` is applied, so
+    the limit is filled with numbers the operators have not seen yet.
+    """
+    excluded_keys = {
+        key
+        for key in (segment_phone_key(phone) for phone in (excluded_phones or ()))
+        if key
+    }
+
     stage_rows: list[dict] = []
     all_contact_ids: set[int] = set()
     failed_contacts: list[int] = []
@@ -268,31 +290,24 @@ def build_bitrix_customer_segment(
             }
         )
 
-    phones = sorted(unique_phones)
+    fresh_phones = sorted(unique_phones - excluded_keys)
+    excluded_count = len(unique_phones) - len(fresh_phones)
+
+    phones = fresh_phones
     if max_phone_count and max_phone_count > 0:
         phones = phones[:max_phone_count]
-        # Keep consistent contact metadata with truncated phones for the final list.
-        truncated_phones_by_contact = []
-        limit_set = set(phones)
-        for row in phones_by_contact:
-            filtered = [phone for phone in row["phones"] if phone in limit_set]
-            if not filtered:
-                continue
-            truncated_phones_by_contact.append(
-                {
-                    "contact_id": row["contact_id"],
-                    "phones": [_to_e164_like(phone) for phone in filtered],
-                }
-            )
-        phones_by_contact = truncated_phones_by_contact
-    else:
-        phones_by_contact = [
-            {
-                "contact_id": row["contact_id"],
-                "phones": [_to_e164_like(phone) for phone in row["phones"]],
-            }
-            for row in phones_by_contact
-        ]
+
+    # Keep contact metadata consistent with the phones that made the final list.
+    selected_phones = set(phones)
+    phones_by_contact = [
+        {
+            "contact_id": row["contact_id"],
+            "phones": [_to_e164_like(phone) for phone in row["phones"] if phone in selected_phones],
+        }
+        for row in phones_by_contact
+        if not selected_phones.isdisjoint(row["phones"])
+    ]
+
     display_phones = [_to_e164_like(phone) for phone in phones]
     return {
         "stage_rows": stage_rows,
@@ -304,6 +319,7 @@ def build_bitrix_customer_segment(
         "requested_phone_count_limit": max_phone_count or 0,
         "collected_contacts": len(phones_by_contact),
         "unique_phones": len(phones),
+        "excluded_phones": excluded_count,
         "failed_contacts": failed_contacts,
     }
 
