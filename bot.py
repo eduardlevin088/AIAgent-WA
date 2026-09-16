@@ -2556,6 +2556,8 @@ async def health() -> dict[str, str]:
 
 
 async def handle_wazzup_webhook_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    logger.info("Wazzup webhook payload: %s", json.dumps(payload, ensure_ascii=False))
+
     if payload.get("test") is True:
         return {"ok": True}
 
