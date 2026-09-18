@@ -5,11 +5,14 @@ from typing import Any
 
 import requests
 from config import BITRIX_BOT_STAGE_ID, BITRIX_DEAL_ENTITY_TYPE_ID, BITRIX_SERVICE_CATEGORY_ID
-from config import BITRIX_WEBHOOK_URL
+from config import BITRIX_STAGE_STATUS_MAP, BITRIX_WEBHOOK_URL
 
 logger = logging.getLogger(__name__)
 
 PHONE_SEGMENT_PATTERN = re.compile(r"^77\d{9}$")
+CLIENT_PHONE_PATTERN = re.compile(r"^\+7\d{10}$")
+BITRIX_CONTACT_ENTITY_TYPE_ID = 3
+BITRIX_DEAL_DESCRIPTION_FIELD = "ufCrm_69E35492D0A18"
 
 
 def bitrix_method_url(method: str) -> str:
@@ -393,6 +396,51 @@ def get_bitrix_deal_stage_id(deal_id: int) -> str | None:
         return None
 
     return None
+
+
+def find_bitrix_client_deals(phone: str) -> list[dict]:
+    """Return service-funnel deals of every Bitrix contact with this phone, newest first."""
+    if not CLIENT_PHONE_PATTERN.fullmatch(phone):
+        raise ValueError("phone must be in the form +7XXXXXXXXXX")
+
+    contacts = call_bitrix_method(
+        "crm.item.list",
+        {
+            "entityTypeId": BITRIX_CONTACT_ENTITY_TYPE_ID,
+            "select": ["id"],
+            "filter": {"phone": phone},
+        },
+    )
+    contact_ids = [
+        int(item["id"])
+        for item in (contacts.get("result") or {}).get("items") or []
+        if item.get("id") is not None
+    ]
+    if not contact_ids:
+        return []
+
+    deals = call_bitrix_method(
+        "crm.item.list",
+        {
+            "entityTypeId": BITRIX_DEAL_ENTITY_TYPE_ID,
+            "filter": {
+                "contactId": contact_ids,
+                "stageId": f"C{BITRIX_SERVICE_CATEGORY_ID}:%",
+            },
+            "select": ["id", "stageId", "createdTime", BITRIX_DEAL_DESCRIPTION_FIELD],
+            "order": {"id": "DESC"},
+        },
+    )
+    return [
+        {
+            "deal_id": int(item["id"]),
+            "status": BITRIX_STAGE_STATUS_MAP.get(str(item.get("stageId")), "Неизвестен"),
+            "created": str(item.get("createdTime") or "")[:10],
+            "description": item.get(BITRIX_DEAL_DESCRIPTION_FIELD) or "",
+        }
+        for item in (deals.get("result") or {}).get("items") or []
+        if item.get("id") is not None
+    ]
 
 
 def create_bitrix_lead(data: dict, username: str, bitrix_id: int | None) -> dict:

@@ -141,5 +141,99 @@ class ToolCallAnsweringTests(unittest.TestCase):
         self.assertEqual(expected, fake.answered_call_ids())
 
 
+class GetClientApplicationsTests(unittest.TestCase):
+    DEALS = [
+        {"deal_id": 2, "status": "Готов", "created": "2026-08-23", "description": "колесо"},
+        {"deal_id": 1, "status": "Выдан", "created": "2026-05-01", "description": "лямка"},
+    ]
+
+    def run_tool(self, arguments, deals=None, request_numbers=None):
+        fake = FakeResponses([
+            response([function_call("call_a", "get_client_applications", arguments)]),
+            response([message()], "ок"),
+        ])
+        with patch.object(agent, "client", SimpleNamespace(responses=fake)), \
+                patch.object(agent, "find_bitrix_client_deals",
+                             side_effect=agent.find_bitrix_client_deals if deals is None
+                             else lambda phone: deals) as find, \
+                patch.object(agent, "run_coro_on_db_loop",
+                             side_effect=lambda coro: coro.close() or (request_numbers or {})):
+            agent.generate_response(
+                user_message="Статус заказа",
+                conversation="conv_test",
+                username="tester",
+                user_id="77000000000",
+            )
+        output = json.loads(fake.requests[1]["input"][0]["output"])["func_response"]
+        return find, output
+
+    def test_defaults_to_whatsapp_number(self):
+        find, _ = self.run_tool({}, deals=[])
+        find.assert_called_once_with("+77000000000")
+
+    def test_uses_explicit_phone(self):
+        find, output = self.run_tool({"phone": "+77071759248"}, deals=[])
+        find.assert_called_once_with("+77071759248")
+        self.assertIn("не найдены", output)
+
+    def test_returns_statuses_with_bot_request_numbers(self):
+        _, output = self.run_tool({}, deals=self.DEALS, request_numbers={2: 57})
+        applications = json.loads(output)["applications"]
+        self.assertEqual([57, None], [a["request_number"] for a in applications])
+        self.assertEqual(["Готов", "Выдан"], [a["status"] for a in applications])
+
+    def test_rejects_malformed_phone(self):
+        _, output = self.run_tool({"phone": "87071759248"})
+        self.assertIn("+7XXXXXXXXXX", output)
+
+
+class GetClientApplicationsTests(unittest.TestCase):
+    DEALS = [
+        {"deal_id": 2, "status": "Готов", "created": "2026-08-23", "description": "колесо"},
+        {"deal_id": 1, "status": "Выдан", "created": "2026-05-01", "description": "лямка"},
+    ]
+
+    def run_tool(self, arguments, deals=None, request_numbers=None):
+        fake = FakeResponses([
+            response([function_call("call_a", "get_client_applications", arguments)]),
+            response([message()], "ок"),
+        ])
+        find_side_effect = (
+            agent.find_bitrix_client_deals if deals is None else (lambda phone: deals)
+        )
+        with patch.object(agent, "client", SimpleNamespace(responses=fake)), \
+                patch.object(agent, "find_bitrix_client_deals",
+                             side_effect=find_side_effect) as find, \
+                patch.object(agent, "run_coro_on_db_loop",
+                             side_effect=lambda coro: coro.close() or (request_numbers or {})):
+            agent.generate_response(
+                user_message="Статус заказа",
+                conversation="conv_test",
+                username="tester",
+                user_id="77000000000",
+            )
+        output = json.loads(fake.requests[1]["input"][0]["output"])["func_response"]
+        return find, output
+
+    def test_defaults_to_whatsapp_number(self):
+        find, _ = self.run_tool({}, deals=[])
+        find.assert_called_once_with("+77000000000")
+
+    def test_uses_explicit_phone(self):
+        find, output = self.run_tool({"phone": "+77071759248"}, deals=[])
+        find.assert_called_once_with("+77071759248")
+        self.assertIn("не найдены", output)
+
+    def test_returns_statuses_with_bot_request_numbers(self):
+        _, output = self.run_tool({}, deals=self.DEALS, request_numbers={2: 57})
+        applications = json.loads(output)["applications"]
+        self.assertEqual([57, None], [a["request_number"] for a in applications])
+        self.assertEqual(["Готов", "Выдан"], [a["status"] for a in applications])
+
+    def test_rejects_malformed_phone(self):
+        _, output = self.run_tool({"phone": "87071759248"})
+        self.assertIn("+7XXXXXXXXXX", output)
+
+
 if __name__ == "__main__":
     unittest.main()
