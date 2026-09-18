@@ -4,8 +4,10 @@ from typing import Callable
 from config import GPT_KEY, GPT_MODEL, AGENT_PROMPT_MAIN_PATH, WARRANTY_RULES_PATH
 from config import GPT_SPARE_MODEL, GPT_TRANSCRIPTION_MODEL
 from .miscellaneous import current_time_utc_offset, is_manager_working_time
-from .integrations import create_bitrix_lead, update_bitrix_repair_request_number
+from .integrations import create_bitrix_lead, find_bitrix_client_deals
+from .integrations import repair_request_title, update_bitrix_repair_request_number
 from database import create_repair_request, get_bitrix_id, set_bitrix_id, run_coro_on_db_loop
+from database import get_request_numbers_by_deal_ids
 import json
 import logging
 
@@ -22,6 +24,9 @@ agent_instructions = (
 logger = logging.getLogger(__name__)
 
 client = OpenAI(api_key=GPT_KEY)
+
+# Only the newest applications go back to the model, to keep the context short.
+MAX_CLIENT_APPLICATIONS = 10
 
 # Hard cap on chained tool rounds per turn. The final round is sent without
 # tools so the model cannot emit yet another function_call we would have to
@@ -49,9 +54,40 @@ tools = [
                 "diagnostic_summary": {"type": "string"},
                 "estimated_price_range": {"type": "string"},
                 "convenient_time": {"type": "string"},
-                "warranty_context": {"type": "string"}
+                "warranty_context": {"type": "string"},
+                "complaint": {
+                    "type": "boolean",
+                    "description": (
+                        "True only when the customer is filing a complaint (e.g. about a previous "
+                        "repair or service quality) rather than requesting a regular repair."
+                    ),
+                    "default": False,
+                }
             },
             "required": ["name", "phone", "city", "service_type", "product_type", "model", "problem"]
+        },
+    },
+    {
+        "type": "function",
+        "name": "get_client_applications",
+        "description": (
+            "Find the customer's existing repair applications in the CRM by phone number: "
+            "status, creation date and problem description of each. Use it when the customer "
+            "asks about the status of an order or mentions an earlier application."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "phone": {
+                    "type": "string",
+                    "description": (
+                        "Phone number strictly in the form +7XXXXXXXXXX, e.g. +77071234567. "
+                        "Pass it only when the customer named a number other than the one they "
+                        "are writing from; omit it to search by their WhatsApp number."
+                    ),
+                },
+            },
+            "required": [],
         },
     },
     {
@@ -132,11 +168,47 @@ def send_contact_details(data: dict, username: str, user_id: str) -> tuple[str, 
     )
     data["request_number"] = request_number
     if result["deal_id"]:
-        update_bitrix_repair_request_number(result["deal_id"], request_number)
+        update_bitrix_repair_request_number(
+            result["deal_id"], request_number, repair_request_title(data)
+        )
 
     if result["bitrix_id"]:
         run_coro_on_db_loop(set_bitrix_id(user_id, result["bitrix_id"]))
     return f"Заявка создана в CRM. Номер заявки: {request_number}", data
+
+
+def get_client_applications(phone: str) -> str:
+    try:
+        deals = find_bitrix_client_deals(phone)
+    except ValueError:
+        return (
+            f"Номер {phone or '(пусто)'} не в формате +7XXXXXXXXXX. "
+            "Уточни у клиента номер телефона и повтори поиск."
+        )
+    if not deals:
+        return f"Заявки по номеру {phone} не найдены."
+
+    deals = deals[:MAX_CLIENT_APPLICATIONS]
+    try:
+        request_numbers = run_coro_on_db_loop(
+            get_request_numbers_by_deal_ids([deal["deal_id"] for deal in deals])
+        )
+    except Exception:
+        logger.exception("Failed to load request numbers for client deals")
+        request_numbers = {}
+
+    applications = [
+        {
+            "request_number": request_numbers.get(deal["deal_id"]),
+            "status": deal["status"],
+            "created": deal["created"],
+            "description": deal["description"],
+        }
+        for deal in deals
+    ]
+    return json.dumps(
+        {"phone": phone, "applications": applications}, ensure_ascii=False
+    )
 
 
 def generate_response(user_message: str | None,
@@ -208,10 +280,16 @@ def generate_response(user_message: str | None,
             if item.name == "send_contact_details":
                 args = json.loads(item.arguments)
                 args["model"] = args.get("model") or "Не указана"
+                args["complaint"] = args.get("complaint") is True
                 func_response, data_to_send = send_contact_details(
                     data=args, username=username, user_id=user_id
                 )
                 return func_response
+
+            if item.name == "get_client_applications":
+                args = json.loads(item.arguments)
+                phone = str(args.get("phone") or "").strip() or f"+{user_id.lstrip('+')}"
+                return get_client_applications(phone)
 
             if item.name == "handoff_to_operator":
                 args = json.loads(item.arguments)

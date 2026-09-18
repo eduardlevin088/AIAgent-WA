@@ -1777,6 +1777,24 @@ async def get_latest_repair_request(user_id: str) -> dict | None:
     return dict(row) if row else None
 
 
+async def get_request_numbers_by_deal_ids(deal_ids: list[int]) -> dict[int, int]:
+    """Map Bitrix deal ids to the bot's request numbers, for deals the bot created."""
+    if db is None:
+        raise RuntimeError("Database not initialized")
+    if not deal_ids:
+        return {}
+
+    placeholders = ", ".join("?" for _ in deal_ids)
+    async with db.execute(f"""
+        SELECT deal_id, request_number
+        FROM repair_requests
+        WHERE deal_id IN ({placeholders}) AND request_number IS NOT NULL
+    """, tuple(deal_ids)) as cursor:
+        rows = await cursor.fetchall()
+
+    return {int(row["deal_id"]): int(row["request_number"]) for row in rows}
+
+
 async def list_repair_requests(
     status: str | None = None,
     q: str | None = None,
