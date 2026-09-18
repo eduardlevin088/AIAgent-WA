@@ -346,7 +346,11 @@ def repair_problem_text(data: dict) -> str:
     return "\n".join(parts)
 
 
-def update_bitrix_repair_request_number(deal_id: int, request_number: int) -> bool:
+def repair_request_title(data: dict) -> str:
+    return "ТЕСТ Жалоба" if data.get("complaint") is True else "ТЕСТ Заявка на ремонт"
+
+
+def update_bitrix_repair_request_number(deal_id: int, request_number: int, title: str) -> bool:
     try:
         response = requests.post(
             bitrix_method_url("crm.item.update"),
@@ -354,7 +358,7 @@ def update_bitrix_repair_request_number(deal_id: int, request_number: int) -> bo
                 "entityTypeId": BITRIX_DEAL_ENTITY_TYPE_ID,
                 "id": deal_id,
                 "fields": {
-                    "TITLE": f"ТЕСТ Заявка на ремонт №{request_number}",
+                    "TITLE": f"{title} №{request_number}",
                 },
             },
         )
@@ -479,7 +483,7 @@ def create_bitrix_lead(data: dict, username: str, bitrix_id: int | None) -> dict
             deal_data = {
                 "entityTypeId": 2,
                 "fields": {
-                    "TITLE": "ТЕСТ " + "Заявка на ремонт",
+                    "TITLE": repair_request_title(data),
                     "categoryId": BITRIX_SERVICE_CATEGORY_ID,
                     "stageId": BITRIX_BOT_STAGE_ID,
                     "opened": "Y",
@@ -503,7 +507,7 @@ def create_bitrix_lead(data: dict, username: str, bitrix_id: int | None) -> dict
             deal_data = {
                 "entityTypeId": 2,
                 "fields": {
-                    "TITLE": "ТЕСТ " + "Заявка на ремонт",
+                    "TITLE": repair_request_title(data),
                     "categoryId": BITRIX_SERVICE_CATEGORY_ID,
                     "stageId": BITRIX_BOT_STAGE_ID,
                     "opened": "Y",

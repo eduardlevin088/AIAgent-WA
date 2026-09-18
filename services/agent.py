@@ -5,7 +5,7 @@ from config import GPT_KEY, GPT_MODEL, AGENT_PROMPT_MAIN_PATH, WARRANTY_RULES_PA
 from config import GPT_SPARE_MODEL, GPT_TRANSCRIPTION_MODEL
 from .miscellaneous import current_time_utc_offset, is_manager_working_time
 from .integrations import create_bitrix_lead, find_bitrix_client_deals
-from .integrations import update_bitrix_repair_request_number
+from .integrations import repair_request_title, update_bitrix_repair_request_number
 from database import create_repair_request, get_bitrix_id, set_bitrix_id, run_coro_on_db_loop
 from database import get_request_numbers_by_deal_ids
 import json
@@ -54,7 +54,15 @@ tools = [
                 "diagnostic_summary": {"type": "string"},
                 "estimated_price_range": {"type": "string"},
                 "convenient_time": {"type": "string"},
-                "warranty_context": {"type": "string"}
+                "warranty_context": {"type": "string"},
+                "complaint": {
+                    "type": "boolean",
+                    "description": (
+                        "True only when the customer is filing a complaint (e.g. about a previous "
+                        "repair or service quality) rather than requesting a regular repair."
+                    ),
+                    "default": False,
+                }
             },
             "required": ["name", "phone", "city", "service_type", "product_type", "model", "problem"]
         },
@@ -160,7 +168,9 @@ def send_contact_details(data: dict, username: str, user_id: str) -> tuple[str, 
     )
     data["request_number"] = request_number
     if result["deal_id"]:
-        update_bitrix_repair_request_number(result["deal_id"], request_number)
+        update_bitrix_repair_request_number(
+            result["deal_id"], request_number, repair_request_title(data)
+        )
 
     if result["bitrix_id"]:
         run_coro_on_db_loop(set_bitrix_id(user_id, result["bitrix_id"]))
@@ -270,6 +280,7 @@ def generate_response(user_message: str | None,
             if item.name == "send_contact_details":
                 args = json.loads(item.arguments)
                 args["model"] = args.get("model") or "Не указана"
+                args["complaint"] = args.get("complaint") is True
                 func_response, data_to_send = send_contact_details(
                     data=args, username=username, user_id=user_id
                 )

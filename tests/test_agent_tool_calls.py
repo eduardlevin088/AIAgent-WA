@@ -235,5 +235,22 @@ class GetClientApplicationsTests(unittest.TestCase):
         self.assertIn("+7XXXXXXXXXX", output)
 
 
+class ComplaintTitleTests(unittest.TestCase):
+    def create(self, data):
+        with patch.object(agent, "create_bitrix_lead",
+                          return_value={"deal_id": 5, "bitrix_id": 7}), \
+                patch.object(agent, "update_bitrix_repair_request_number") as update, \
+                patch.object(agent, "run_coro_on_db_loop",
+                             side_effect=lambda coro: coro.close() or 42):
+            agent.send_contact_details(data=data, username="tester", user_id="77000000000")
+        return update.call_args.args
+
+    def test_regular_application_title(self):
+        self.assertEqual((5, 42, "ТЕСТ Заявка на ремонт"), self.create({"complaint": False}))
+
+    def test_complaint_title(self):
+        self.assertEqual((5, 42, "ТЕСТ Жалоба"), self.create({"complaint": True}))
+
+
 if __name__ == "__main__":
     unittest.main()
