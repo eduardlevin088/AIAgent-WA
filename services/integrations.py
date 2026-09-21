@@ -10,9 +10,10 @@ from config import BITRIX_STAGE_STATUS_MAP, BITRIX_WEBHOOK_URL
 logger = logging.getLogger(__name__)
 
 PHONE_SEGMENT_PATTERN = re.compile(r"^77\d{9}$")
-CLIENT_PHONE_PATTERN = re.compile(r"^\+7\d{10}$")
+CLIENT_PHONE_PATTERN = re.compile(r"^\+?[78]?(\d{10})$")
 BITRIX_CONTACT_ENTITY_TYPE_ID = 3
 BITRIX_DEAL_DESCRIPTION_FIELD = "ufCrm_69E35492D0A18"
+BITRIX_DEAL_NUMBER_FIELD = "ufCrm_1779108599590"
 
 
 def bitrix_method_url(method: str) -> str:
@@ -404,15 +405,20 @@ def get_bitrix_deal_stage_id(deal_id: int) -> str | None:
 
 def find_bitrix_client_deals(phone: str) -> list[dict]:
     """Return service-funnel deals of every Bitrix contact with this phone, newest first."""
-    if not CLIENT_PHONE_PATTERN.fullmatch(phone):
+    match = CLIENT_PHONE_PATTERN.fullmatch(re.sub(r"[\s()-]", "", phone or ""))
+    if not match:
         raise ValueError("phone must be in the form +7XXXXXXXXXX")
+
+    # Bitrix stores the same number as +7..., 8... or bare 7..., so the last ten
+    # digits with a leading wildcard are what actually matches every variant.
+    phone_filter = f"%{match.group(1)}"
 
     contacts = call_bitrix_method(
         "crm.item.list",
         {
             "entityTypeId": BITRIX_CONTACT_ENTITY_TYPE_ID,
             "select": ["id"],
-            "filter": {"phone": phone},
+            "filter": {"phone": phone_filter},
         },
     )
     contact_ids = [
@@ -431,7 +437,7 @@ def find_bitrix_client_deals(phone: str) -> list[dict]:
                 "contactId": contact_ids,
                 "stageId": f"C{BITRIX_SERVICE_CATEGORY_ID}:%",
             },
-            "select": ["id", "stageId", "createdTime", BITRIX_DEAL_DESCRIPTION_FIELD],
+            "select": ["id", "stageId", "createdTime", BITRIX_DEAL_NUMBER_FIELD],
             "order": {"id": "DESC"},
         },
     )
@@ -440,7 +446,7 @@ def find_bitrix_client_deals(phone: str) -> list[dict]:
             "deal_id": int(item["id"]),
             "status": BITRIX_STAGE_STATUS_MAP.get(str(item.get("stageId")), "Неизвестен"),
             "created": str(item.get("createdTime") or "")[:10],
-            "description": item.get(BITRIX_DEAL_DESCRIPTION_FIELD) or "",
+            "number": item.get(BITRIX_DEAL_NUMBER_FIELD) or None,
         }
         for item in (deals.get("result") or {}).get("items") or []
         if item.get("id") is not None

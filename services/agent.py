@@ -81,7 +81,7 @@ tools = [
                 "phone": {
                     "type": "string",
                     "description": (
-                        "Phone number strictly in the form +7XXXXXXXXXX, e.g. +77071234567. "
+                        "Phone number in the form +7XXXXXXXXXX, e.g. +77071234567. "
                         "Pass it only when the customer named a number other than the one they "
                         "are writing from; omit it to search by their WhatsApp number."
                     ),
@@ -199,10 +199,9 @@ def get_client_applications(phone: str) -> str:
 
     applications = [
         {
-            "request_number": request_numbers.get(deal["deal_id"]),
+            "number": deal["number"] or request_numbers.get(deal["deal_id"]),
             "status": deal["status"],
             "created": deal["created"],
-            "description": deal["description"],
         }
         for deal in deals
     ]
