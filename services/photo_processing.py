@@ -33,11 +33,19 @@ class PhotoProcessingResult:
     data: dict[str, Any] | list[Any] | None
 
     def as_agent_context(self) -> str:
-        if self.data is not None:
+        if isinstance(self.data, dict):
+            # Prices come only from the diagnostic rules in the agent prompt.
+            data = {key: value for key, value in self.data.items() if "cost" not in key and "price" not in key}
+            payload = json.dumps(data, ensure_ascii=False)
+        elif self.data is not None:
             payload = json.dumps(self.data, ensure_ascii=False)
         else:
             payload = self.raw_text
-        return f"Анализ фото повреждения:\n{payload}"
+        return (
+            "Анализ фото повреждения (внутренняя подсказка: не пересказывай её клиенту дословно, "
+            "не проси фото деталей, которых нет у изделия клиента, цены бери только из правил "
+            f"диагностики):\n{payload}"
+        )
 
 
 def load_photo_processing_instructions(path: Path = PHOTO_PROCESSING_INSTRUCTIONS_PATH) -> str:
@@ -79,7 +87,15 @@ def analyze_photo_bytes(
     content_type: str | None,
     instructions: str,
     model: str = PHOTO_PROCESSING_MODEL,
+    dialog_context: str | None = None,
 ) -> str:
+    text = (
+        f"{instructions}\n\n"
+        "Если в инструкции не указан формат ответа, верни компактный JSON. "
+        "Не добавляй markdown вокруг JSON."
+    )
+    if dialog_context:
+        text += f"\n\nПоследние сообщения переписки с клиентом:\n{dialog_context}"
     response = client.responses.create(
         model=model,
         input=[
@@ -88,11 +104,7 @@ def analyze_photo_bytes(
                 "content": [
                     {
                         "type": "input_text",
-                        "text": (
-                            f"{instructions}\n\n"
-                            "Если в инструкции не указан формат ответа, верни компактный JSON. "
-                            "Не добавляй markdown вокруг JSON."
-                        ),
+                        "text": text,
                     },
                     {
                         "type": "input_image",
@@ -111,6 +123,7 @@ async def process_incoming_photo(
     downloaded_content: DownloadedContent | None = None,
     instruction_path: Path = PHOTO_PROCESSING_INSTRUCTIONS_PATH,
     model: str = PHOTO_PROCESSING_MODEL,
+    dialog_context: str | None = None,
 ) -> PhotoProcessingResult:
     content_uri = str(message.get("contentUri") or "").strip()
     if not content_uri:
@@ -124,6 +137,7 @@ async def process_incoming_photo(
         content.content_type,
         instructions,
         model,
+        dialog_context,
     )
 
     return PhotoProcessingResult(
@@ -142,12 +156,14 @@ async def maybe_process_incoming_photo(
     message: dict[str, Any],
     wazzup: WazzupClient,
     downloaded_content: DownloadedContent | None = None,
+    dialog_context: str | None = None,
 ) -> PhotoProcessingResult | None:
     try:
         return await process_incoming_photo(
             message=message,
             wazzup=wazzup,
             downloaded_content=downloaded_content,
+            dialog_context=dialog_context,
         )
     except PhotoProcessingInstructionsMissing:
         return None

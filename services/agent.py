@@ -8,6 +8,7 @@ from .integrations import create_bitrix_lead, find_bitrix_client_deals
 from .integrations import repair_request_title, update_bitrix_repair_request_number
 from database import create_repair_request, get_bitrix_id, set_bitrix_id, run_coro_on_db_loop
 from database import get_request_numbers_by_deal_ids
+from .service_centers import service_centers_prompt_text
 import json
 import logging
 
@@ -18,7 +19,8 @@ with open(WARRANTY_RULES_PATH, "r", encoding="utf-8") as f:
     WARRANTY_RULES_TEXT = f.read().strip()
 
 agent_instructions = (
-    f"{agent_prompt_main}\n\nПравила гарантийного блока:\n{WARRANTY_RULES_TEXT}"
+    f"{agent_prompt_main.replace('{{SERVICE_CENTERS}}', service_centers_prompt_text())}"
+    f"\n\nПравила гарантийного блока:\n{WARRANTY_RULES_TEXT}"
 )
 
 logger = logging.getLogger(__name__)
@@ -282,7 +284,10 @@ def generate_response(user_message: str | None,
             "response_id": response.id if response else None
         }
 
-    instructions = f"{agent_instructions}\n\nCurrent time is {current_time}"
+    instructions = (
+        f"{agent_instructions}\n\nCurrent time is {current_time}"
+        f"\nНомер WhatsApp клиента: +{user_id.lstrip('+')}"
+    )
     
     agent_input = []
     if user_message:
@@ -408,7 +413,7 @@ def generate_response(user_message: str | None,
 
         response = client.responses.create(
             model=model,
-            instructions=agent_instructions,
+            instructions=instructions,
             tools=[] if is_last_round else tools,
             input=agent_input,
             conversation=conversation,

@@ -65,6 +65,7 @@ from services.miscellaneous import get_manager_working_hours
 from services.miscellaneous import set_manager_working_hours
 from services.new_conv import new_conversation
 from services.photo_processing import maybe_process_incoming_photo
+from services.service_centers import service_center_message
 from services.warranty import warranty_assessment_message
 from services.wazzup import DownloadedContent, WazzupClient
 
@@ -1209,6 +1210,9 @@ async def reply_to_batch(
     if result["data to send"]:
         await handle_completed_request(user, result["data to send"], channel_id, chat_type)
         await log_event(user.id, "lead_created", str(result["data to send"].get("deal_id")))
+        address_text = service_center_message(result["data to send"].get("city"))
+        await wazzup.send_text(user.id, address_text, channel_id=channel_id, chat_type=chat_type)
+        await append_dialog_message(user.id, "assistant", "text", address_text)
         await wazzup.send_text(user.id, FEEDBACK_REQUEST_TEXT, channel_id=channel_id, chat_type=chat_type)
         await append_dialog_message(user.id, "assistant", "text", FEEDBACK_REQUEST_TEXT)
 
@@ -1394,6 +1398,17 @@ async def process_text_message(
     )
 
 
+async def recent_dialog_context(user_id: str, limit: int = 12) -> str:
+    """The latest messages as plain text, so photo analysis knows the product and problem."""
+    speakers = {"user": "Клиент", "assistant": "Бот", "operator": "Менеджер"}
+    lines = []
+    for row in await get_recent_dialog(user_id, limit=limit):
+        text = " ".join((row["text"] or "").split())
+        if text:
+            lines.append(f"{speakers.get(row['role'], row['role'])}: {text[:300]}")
+    return "\n".join(lines)
+
+
 async def process_image_message(
     user: ChatUser,
     message: dict[str, Any],
@@ -1417,6 +1432,7 @@ async def process_image_message(
             message=message,
             wazzup=wazzup,
             downloaded_content=content,
+            dialog_context=await recent_dialog_context(user.id),
         )
 
     system_message = (
