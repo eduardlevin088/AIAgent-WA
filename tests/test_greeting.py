@@ -76,6 +76,7 @@ class GreetingTests(unittest.IsolatedAsyncioTestCase):
             unittest.mock.patch.object(bot, "create_or_update_user", AsyncMock()),
             unittest.mock.patch.object(bot, "cancel_open_operator_handoff", AsyncMock()),
             unittest.mock.patch.object(bot, "set_bot_paused", AsyncMock()),
+            unittest.mock.patch.object(bot, "clear_media_files", AsyncMock()) as clear_media,
             unittest.mock.patch.object(bot, "append_dialog_message", AsyncMock()) as append_message,
             unittest.mock.patch.object(bot, "generate_response_with_retry", AsyncMock()) as generate,
             unittest.mock.patch.object(bot.wazzup, "send_text", AsyncMock()) as send_text,
@@ -87,6 +88,8 @@ class GreetingTests(unittest.IsolatedAsyncioTestCase):
             )
 
         generate.assert_not_awaited()
+        # Photos from the abandoned dialogue must not reach the next request.
+        clear_media.assert_awaited_once_with(user.id)
         # The model must see the greeting, or it greets the customer again.
         new_conversation_mock.assert_awaited_once_with(bot.GREETING_TEXT)
         send_text.assert_awaited_once_with(

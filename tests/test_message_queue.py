@@ -164,6 +164,7 @@ class MessageQueueTests(unittest.IsolatedAsyncioTestCase):
             patch.object(bot, "create_or_update_user", AsyncMock()),
             patch.object(bot, "cancel_open_operator_handoff", AsyncMock()),
             patch.object(bot, "set_bot_paused", AsyncMock()),
+            patch.object(bot, "clear_media_files", AsyncMock()),
         ):
             first = await self.inbound("Колесо")
             task = asyncio.create_task(

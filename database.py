@@ -1037,25 +1037,16 @@ async def save_media_file(
     await db.commit()
 
 
-async def get_file_ids(user_id: str) -> list[str]:
+async def clear_media_files(user_id: str) -> None:
+    """Forget files from an abandoned dialogue so they are not attached to the next request."""
     if db is None:
         raise RuntimeError("Database not initialized")
-    
-    async with db.execute("""
-        SELECT file_id FROM media
-        WHERE user_id = ?
-    """, (user_id,)) as cursor:
-        rows = await cursor.fetchall()
-
-    file_ids = [row[0] for row in rows]
 
     await db.execute("""
         DELETE FROM media
         WHERE user_id = ?
     """, (user_id,))
     await db.commit()
-
-    return file_ids
 
 
 async def get_media_files(user_id: str, media_types: Sequence[str] | None = None) -> list[dict]:
@@ -1073,6 +1064,7 @@ async def get_media_files(user_id: str, media_types: Sequence[str] | None = None
         SELECT file_id, file_path, filename, content_type, media_type, source_message_id, content_uri
         FROM media
         WHERE user_id = ?{type_filter}
+        ORDER BY created_at
     """, params) as cursor:
         rows = await cursor.fetchall()
 
@@ -1085,27 +1077,6 @@ async def get_media_files(user_id: str, media_types: Sequence[str] | None = None
     await db.commit()
 
     return media_files
-
-
-async def count_media_files(user_id: str, media_types: Sequence[str] | None = None) -> int:
-    if db is None:
-        raise RuntimeError("Database not initialized")
-
-    params: list[str] = [user_id]
-    type_filter = ""
-    if media_types:
-        placeholders = ", ".join("?" for _ in media_types)
-        type_filter = f" AND media_type IN ({placeholders})"
-        params.extend(media_types)
-
-    async with db.execute(f"""
-        SELECT COUNT(*) AS count
-        FROM media
-        WHERE user_id = ?{type_filter}
-    """, params) as cursor:
-        row = await cursor.fetchone()
-
-    return row["count"] if row else 0
 
 
 async def get_users():

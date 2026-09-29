@@ -29,7 +29,7 @@ from database import cancel_queued_dialog_messages, claim_new_dialog_messages
 from database import queue_dialog_message, requeue_unfinished_dialog_messages
 from database import set_dialog_messages_status
 from database import close_db, close_expired_operator_handoffs, complete_customer_segment_job
-from database import count_media_files
+from database import clear_media_files
 from database import create_admin, create_operator_handoff
 from database import create_customer_segment_job, create_or_update_user, delete_admin
 from database import execute_query, fail_customer_segment_job, get_admin_ids
@@ -75,7 +75,8 @@ logger = logging.getLogger(__name__)
 
 wazzup = WazzupClient(outbound_message_recorder=mark_message_processed)
 GREETING_TEXT = GREETING_TEXT_PATH.read_text(encoding="utf-8").strip()
-REQUEST_MEDIA_LIMIT = 5
+# The chat accepts any number of photos/videos; only the first ones go to the Bitrix deal.
+BITRIX_MEDIA_LIMIT = 5
 FEEDBACK_REQUEST_TEXT = "Оцените, пожалуйста, консультацию: напишите цифру от 1 до 5."
 # Includes the earlier wording, so requests sent before a deploy still count.
 FEEDBACK_REQUEST_TEXTS = {
@@ -844,10 +845,6 @@ async def store_wazzup_content(
     return content
 
 
-async def stored_request_media_count(user_id: str) -> int:
-    return await count_media_files(user_id, media_types=["image", "video"])
-
-
 async def handle_completed_request(
     user: ChatUser,
     data_to_send: dict[str, Any],
@@ -855,10 +852,16 @@ async def handle_completed_request(
     chat_type: str,
 ) -> None:
     admin_ids = await get_admin_ids()
-    media_files = await get_media_files(user.id, media_types=["image", "video"])
+    received_media = await get_media_files(user.id, media_types=["image", "video"])
+    media_files = received_media[:BITRIX_MEDIA_LIMIT]
 
     admin_text = format_message(data_to_send)
-    if media_files:
+    if len(received_media) > BITRIX_MEDIA_LIMIT:
+        admin_text += (
+            f"\n\nФото/видео: клиент прислал {len(received_media)}, "
+            f"к сделке Bitrix прикреплены первые {BITRIX_MEDIA_LIMIT}. Остальные — в переписке WhatsApp."
+        )
+    elif media_files:
         admin_text += f"\n\nФото: {len(media_files)} файл(а) прикреплены к сделке Bitrix."
 
     for admin_id in admin_ids:
@@ -1229,6 +1232,7 @@ async def reset_conversation(
     _user_conversation_epochs[user.id] = _user_conversation_epochs.get(user.id, 0) + 1
     if dialog_message_id is not None:
         await cancel_queued_dialog_messages(user.id, dialog_message_id)
+    await clear_media_files(user.id)
 
     conversation = await new_conversation(GREETING_TEXT)
     await create_or_update_user(
@@ -1416,15 +1420,6 @@ async def process_image_message(
     chat_type: str,
     dialog_message_id: int | None = None,
 ) -> None:
-    if await stored_request_media_count(user.id) >= REQUEST_MEDIA_LIMIT:
-        await wazzup.send_text(
-            user.id,
-            "Файл не добавлен: к заявке можно приложить до 5 фото или видео.",
-            channel_id=channel_id,
-            chat_type=chat_type,
-        )
-        return
-
     content = await store_wazzup_content(user, message, media_type="image")
     photo_analysis = None
     if content:
@@ -1463,15 +1458,6 @@ async def process_video_message(
     chat_type: str,
     dialog_message_id: int | None = None,
 ) -> None:
-    if await stored_request_media_count(user.id) >= REQUEST_MEDIA_LIMIT:
-        await wazzup.send_text(
-            user.id,
-            "Файл не добавлен: к заявке можно приложить до 5 фото или видео.",
-            channel_id=channel_id,
-            chat_type=chat_type,
-        )
-        return
-
     await store_wazzup_content(user, message, media_type="video")
     system_message = (
         "Пользователь только что отправил видео повреждения. "
