@@ -28,17 +28,38 @@ client = OpenAI(api_key=GPT_KEY)
 # Only the newest applications go back to the model, to keep the context short.
 MAX_CLIENT_APPLICATIONS = 10
 
+# Bitrix final stages ("Выдан", "Передан на утилизацию"): the customer only
+# asks about applications that are still open.
+CLOSED_DEAL_STAGE_SUFFIXES = (":WON", ":LOSE")
+
 # Hard cap on chained tool rounds per turn. The final round is sent without
 # tools so the model cannot emit yet another function_call we would have to
 # answer -- every call is always answered before we return.
 MAX_TOOL_ROUNDS = 4
+
+# Conversations whose request summary was requested in an earlier turn. A
+# request is only created on a later turn, after the customer has seen the
+# summary and confirmed it.
+_summary_requested_conversations: set[str] = set()
+
+SHOW_SUMMARY_FIRST = (
+    "Заявка ещё НЕ создана. Отправь клиенту сводку данных по шаблону "
+    "«Проверьте, пожалуйста, данные: …» и попроси подтвердить. "
+    "Когда клиент явно подтвердит данные, вызови send_contact_details снова "
+    "с теми же данными и confirmed=true."
+)
 
 
 tools = [
     {
         "type": "function",
         "name": "send_contact_details",
-        "description": "Send FULLY COLLECTED repair request to manager ONLY after all required fields are known.",
+        "description": (
+            "Create the repair request once all required fields are known. The first call "
+            "(confirmed=false) does not create anything: it tells you to show the customer "
+            "the summary. Call again with confirmed=true only after the customer explicitly "
+            "confirmed that summary."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -55,6 +76,14 @@ tools = [
                 "estimated_price_range": {"type": "string"},
                 "convenient_time": {"type": "string"},
                 "warranty_context": {"type": "string"},
+                "confirmed": {
+                    "type": "boolean",
+                    "description": (
+                        "True only when the customer explicitly confirmed the summary you "
+                        "showed them in a previous message."
+                    ),
+                    "default": False,
+                },
                 "complaint": {
                     "type": "boolean",
                     "description": (
@@ -71,9 +100,10 @@ tools = [
         "type": "function",
         "name": "get_client_applications",
         "description": (
-            "Find the customer's existing repair applications in the CRM by phone number: "
-            "status, creation date and problem description of each. Use it when the customer "
-            "asks about the status of an order or mentions an earlier application."
+            "Find the customer's open repair applications in the CRM by phone number: "
+            "number, status and creation date of each. Applications that are already issued "
+            "or closed are not returned. Use it when the customer asks about the status of "
+            "an order or mentions an earlier application."
         ),
         "parameters": {
             "type": "object",
@@ -188,6 +218,16 @@ def get_client_applications(phone: str) -> str:
     if not deals:
         return f"Заявки по номеру {phone} не найдены."
 
+    deals = [
+        deal for deal in deals
+        if not str(deal.get("stage_id") or "").endswith(CLOSED_DEAL_STAGE_SUFFIXES)
+    ]
+    if not deals:
+        return (
+            f"По номеру {phone} нет активных заявок: все заявки уже выданы или закрыты. "
+            "Закрытые заявки клиенту не перечисляй."
+        )
+
     deals = deals[:MAX_CLIENT_APPLICATIONS]
     try:
         request_numbers = run_coro_on_db_loop(
@@ -225,6 +265,8 @@ def generate_response(user_message: str | None,
     output_tokens = 0
     current_time = current_time_utc_offset()
     response = None
+
+    summary_requested_this_turn = False
 
     def can_continue() -> bool:
         return should_continue is None or should_continue()
@@ -270,7 +312,7 @@ def generate_response(user_message: str | None,
     output_tokens += usage.output_tokens
 
     def run_function_call(item) -> str:
-        nonlocal data_to_send, handoff
+        nonlocal data_to_send, handoff, summary_requested_this_turn
 
         if not can_continue():
             return "Запрос отменён: клиент отправил новое сообщение."
@@ -278,11 +320,21 @@ def generate_response(user_message: str | None,
         try:
             if item.name == "send_contact_details":
                 args = json.loads(item.arguments)
+                confirmed = args.pop("confirmed", False) is True
+                if (
+                    not confirmed
+                    or summary_requested_this_turn
+                    or conversation not in _summary_requested_conversations
+                ):
+                    _summary_requested_conversations.add(conversation)
+                    summary_requested_this_turn = True
+                    return SHOW_SUMMARY_FIRST
                 args["model"] = args.get("model") or "Не указана"
                 args["complaint"] = args.get("complaint") is True
                 func_response, data_to_send = send_contact_details(
                     data=args, username=username, user_id=user_id
                 )
+                _summary_requested_conversations.discard(conversation)
                 return func_response
 
             if item.name == "get_client_applications":

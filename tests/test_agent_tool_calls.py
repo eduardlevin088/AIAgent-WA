@@ -143,8 +143,12 @@ class ToolCallAnsweringTests(unittest.TestCase):
 
 class GetClientApplicationsTests(unittest.TestCase):
     DEALS = [
-        {"deal_id": 2, "status": "Готов", "created": "2026-08-23", "number": None},
-        {"deal_id": 1, "status": "Выдан", "created": "2026-05-01", "number": "11557"},
+        {"deal_id": 3, "stage_id": "C5:FINAL_INVOICE", "status": "Готов",
+         "created": "2026-08-23", "number": None},
+        {"deal_id": 2, "stage_id": "C5:EXECUTING", "status": "В работе",
+         "created": "2026-06-10", "number": "11560"},
+        {"deal_id": 1, "stage_id": "C5:WON", "status": "Выдан",
+         "created": "2026-05-01", "number": "11557"},
     ]
 
     def run_tool(self, arguments, deals=None, request_numbers=None):
@@ -177,12 +181,26 @@ class GetClientApplicationsTests(unittest.TestCase):
         self.assertIn("не найдены", output)
 
     def test_returns_statuses_with_numbers(self):
-        _, output = self.run_tool({}, deals=self.DEALS, request_numbers={2: 57})
+        _, output = self.run_tool({}, deals=self.DEALS, request_numbers={3: 57})
         applications = json.loads(output)["applications"]
         # The Bitrix number wins; the bot's own number fills in where it is empty.
-        self.assertEqual([57, "11557"], [a["number"] for a in applications])
-        self.assertEqual(["Готов", "Выдан"], [a["status"] for a in applications])
+        self.assertEqual([57, "11560"], [a["number"] for a in applications])
+        self.assertEqual(["Готов", "В работе"], [a["status"] for a in applications])
         self.assertNotIn("description", applications[0])
+
+    def test_skips_issued_and_closed_applications(self):
+        deals = self.DEALS + [
+            {"deal_id": 0, "stage_id": "C5:LOSE", "status": "Передан на утилизацию",
+             "created": "2026-01-01", "number": "11500"},
+        ]
+        _, output = self.run_tool({}, deals=deals)
+        numbers = [a["number"] for a in json.loads(output)["applications"]]
+        self.assertNotIn("11557", numbers)
+        self.assertNotIn("11500", numbers)
+
+    def test_reports_no_active_applications_when_all_are_closed(self):
+        _, output = self.run_tool({}, deals=[self.DEALS[-1]])
+        self.assertIn("нет активных заявок", output)
 
     def test_accepts_a_number_written_with_a_leading_eight(self):
         find, _ = self.run_tool({"phone": "87071759248"}, deals=[])
@@ -191,6 +209,67 @@ class GetClientApplicationsTests(unittest.TestCase):
     def test_rejects_malformed_phone(self):
         _, output = self.run_tool({"phone": "707-12-34"})
         self.assertIn("+7XXXXXXXXXX", output)
+
+
+class RequestConfirmationTests(unittest.TestCase):
+    """A request is created only after the customer confirmed the summary."""
+
+    DATA = {
+        "name": "Нурбол", "phone": "87762015818", "city": "Астана",
+        "service_type": "Ремонт фурнитуры", "product_type": "Чемодан",
+        "model": "Не указана", "problem": "Сломано колесо",
+    }
+
+    def setUp(self):
+        agent._summary_requested_conversations.clear()
+
+    def turn(self, *calls, conversation="conv_test"):
+        fake = FakeResponses([
+            response([
+                function_call(f"call_{i}", "send_contact_details", {**self.DATA, "confirmed": confirmed})
+                for i, confirmed in enumerate(calls)
+            ]),
+            response([message()], "ок"),
+        ])
+        with patch.object(agent, "client", SimpleNamespace(responses=fake)), \
+                patch.object(agent, "send_contact_details",
+                             return_value=("Заявка создана в CRM. Номер заявки: 10509", {"deal_id": 1})) as create:
+            result = agent.generate_response(
+                user_message="Да",
+                conversation=conversation,
+                username="tester",
+                user_id="77000000000",
+            )
+        output = json.loads(fake.requests[1]["input"][0]["output"])["func_response"]
+        return create, result, output
+
+    def test_first_call_only_asks_for_the_summary(self):
+        create, result, output = self.turn(False)
+        create.assert_not_called()
+        self.assertIsNone(result["data to send"])
+        self.assertIn("НЕ создана", output)
+
+    def test_confirmation_without_a_shown_summary_is_rejected(self):
+        create, result, _ = self.turn(True)
+        create.assert_not_called()
+        self.assertIsNone(result["data to send"])
+
+    def test_summary_and_confirmation_in_the_same_turn_are_rejected(self):
+        create, _, _ = self.turn(False, True)
+        create.assert_not_called()
+
+    def test_confirmation_on_a_later_turn_creates_the_request(self):
+        self.turn(False)
+        create, result, output = self.turn(True)
+        create.assert_called_once()
+        self.assertNotIn("confirmed", create.call_args.kwargs["data"])
+        self.assertEqual({"deal_id": 1}, result["data to send"])
+        self.assertIn("10509", output)
+
+    def test_summary_from_another_conversation_does_not_count(self):
+        self.turn(False, conversation="conv_old")
+        create, _, _ = self.turn(True, conversation="conv_new")
+        create.assert_not_called()
 
 
 class ComplaintTitleTests(unittest.TestCase):

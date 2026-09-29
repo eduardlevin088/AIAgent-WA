@@ -5,7 +5,6 @@ import io
 import json
 import logging
 import re
-import threading
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime
@@ -26,6 +25,9 @@ from config import MANAGER_HANDOFF_POLL_SECONDS, MANAGER_HANDOFF_TIMEOUT_MINUTES
 from config import MANAGER_LOG_CLEANUP_INTERVAL_SECONDS
 from config import SUPERADMIN_ID, WAZZUP_CHANNEL_ID, WAZZUP_CHAT_LINK_BASE, WAZZUP_CHAT_TYPE
 from database import add_token_usage, append_dialog_message, cancel_open_operator_handoff
+from database import cancel_queued_dialog_messages, claim_new_dialog_messages
+from database import queue_dialog_message, requeue_unfinished_dialog_messages
+from database import set_dialog_messages_status
 from database import close_db, close_expired_operator_handoffs, complete_customer_segment_job
 from database import count_media_files
 from database import create_admin, create_operator_handoff
@@ -73,12 +75,20 @@ logger = logging.getLogger(__name__)
 wazzup = WazzupClient(outbound_message_recorder=mark_message_processed)
 GREETING_TEXT = GREETING_TEXT_PATH.read_text(encoding="utf-8").strip()
 REQUEST_MEDIA_LIMIT = 5
-RESPONSE_DEBOUNCE_SECONDS = 1.0
+FEEDBACK_REQUEST_TEXT = "Оцените, пожалуйста, консультацию: напишите цифру от 1 до 5."
+# Includes the earlier wording, so requests sent before a deploy still count.
+FEEDBACK_REQUEST_TEXTS = {
+    FEEDBACK_REQUEST_TEXT,
+    "Оцените, пожалуйста, консультацию от 1 до 5. Можно написать: оценка 5",
+}
+# How long to wait for the rest of a burst ("Чемодан" / "Самсонайт") before replying.
+RESPONSE_DEBOUNCE_SECONDS = 2.0
 GENERATION_BUSY_RETRY_ATTEMPTS = 3
 GENERATION_BUSY_RETRY_DELAY_SECONDS = 0.75
-_user_activity_versions: dict[str, int] = {}
-_user_activity_lock = threading.Lock()
 _user_generation_locks: dict[str, asyncio.Lock] = {}
+# Bumped on every dialogue restart, so a reply generated on the old
+# conversation is not sent after the greeting.
+_user_conversation_epochs: dict[str, int] = {}
 CUSTOMER_GREETING_PHRASES = {
     "ассаламу алейкум",
     "ассалаумагалейкум",
@@ -192,6 +202,7 @@ async def lifespan(app: FastAPI):
         await create_admin(admin_id)
 
     await cleanup_expired_manager_logs()
+    await requeue_unfinished_dialog_messages()
 
     handoff_timeout_task = asyncio.create_task(manager_handoff_timeout_worker())
     manager_logs_cleanup_task = asyncio.create_task(manager_logs_cleanup_worker())
@@ -601,22 +612,6 @@ async def notify_customer_about_bitrix_status(
     return True
 
 
-async def record_user_activity(user_id: str) -> int:
-    with _user_activity_lock:
-        version = _user_activity_versions.get(user_id, 0) + 1
-        _user_activity_versions[user_id] = version
-        return version
-
-
-def is_latest_activity_sync(user_id: str, version: int) -> bool:
-    with _user_activity_lock:
-        return _user_activity_versions.get(user_id) == version
-
-
-async def is_latest_activity(user_id: str, version: int) -> bool:
-    return is_latest_activity_sync(user_id, version)
-
-
 def generation_lock_for_user(user_id: str) -> asyncio.Lock:
     lock = _user_generation_locks.get(user_id)
     if lock is None:
@@ -663,66 +658,49 @@ async def replace_poisoned_conversation(user: ChatUser) -> str:
     return conversation
 
 
-async def generate_response_serialized(
+async def generate_response_with_retry(
     user: ChatUser,
     conversation: str,
     user_message: str | None,
-    activity_version: int,
     system_message: str | None = None,
     exceeded: bool = False,
 ) -> dict[str, Any] | None:
-    lock = generation_lock_for_user(user.id)
-
-    async with lock:
-        if not await is_latest_activity(user.id, activity_version):
-            await log_event(user.id, "stale_after_generation_lock", None)
-            return None
-
-        def should_continue_generation() -> bool:
-            return is_latest_activity_sync(user.id, activity_version)
-
-        for attempt in range(1, GENERATION_BUSY_RETRY_ATTEMPTS + 1):
-            if not is_latest_activity_sync(user.id, activity_version):
-                await log_event(user.id, "stale_before_generation_attempt", str(attempt))
-                return None
-
-            try:
-                return await asyncio.to_thread(
-                    generate_response,
-                    user_message=user_message,
-                    conversation=conversation,
-                    username=user.username,
-                    user_id=user.id,
-                    system_message=system_message,
-                    exceeded=exceeded,
-                    should_continue=should_continue_generation,
+    """Run the agent; the caller must hold the user's generation lock."""
+    for attempt in range(1, GENERATION_BUSY_RETRY_ATTEMPTS + 1):
+        try:
+            return await asyncio.to_thread(
+                generate_response,
+                user_message=user_message,
+                conversation=conversation,
+                username=user.username,
+                user_id=user.id,
+                system_message=system_message,
+                exceeded=exceeded,
+            )
+        except Exception as error:
+            if (
+                attempt < GENERATION_BUSY_RETRY_ATTEMPTS
+                and is_openai_conversation_busy_error(error)
+            ):
+                await log_event(
+                    user.id,
+                    "openai_conversation_busy_retry",
+                    f"attempt={attempt}; error={str(error)[:400]}",
                 )
-            except Exception as error:
-                if (
-                    attempt < GENERATION_BUSY_RETRY_ATTEMPTS
-                    and is_openai_conversation_busy_error(error)
-                    and is_latest_activity_sync(user.id, activity_version)
-                ):
-                    await log_event(
-                        user.id,
-                        "openai_conversation_busy_retry",
-                        f"attempt={attempt}; error={str(error)[:400]}",
-                    )
-                    await asyncio.sleep(GENERATION_BUSY_RETRY_DELAY_SECONDS * attempt)
-                    continue
-                if (
-                    attempt < GENERATION_BUSY_RETRY_ATTEMPTS
-                    and is_openai_missing_tool_output_error(error)
-                    and is_latest_activity_sync(user.id, activity_version)
-                ):
-                    await log_event(
-                        user.id,
-                        "openai_conversation_poisoned_reset",
-                        str(error)[:400],
-                    )
-                    conversation = await replace_poisoned_conversation(user)
-                    continue
-                raise
+                await asyncio.sleep(GENERATION_BUSY_RETRY_DELAY_SECONDS * attempt)
+                continue
+            if (
+                attempt < GENERATION_BUSY_RETRY_ATTEMPTS
+                and is_openai_missing_tool_output_error(error)
+            ):
+                await log_event(
+                    user.id,
+                    "openai_conversation_poisoned_reset",
+                    str(error)[:400],
+                )
+                conversation = await replace_poisoned_conversation(user)
+                continue
+            raise
 
     return None
 
@@ -1084,17 +1062,43 @@ async def handle_handoff(
     await notify_handoff_recipients(admin_text, channel_id, chat_type)
 
 
+async def is_awaiting_feedback(user_id: str) -> bool:
+    """True while the bot's latest message to the user is the rating request."""
+    for row in reversed(await get_recent_dialog(user_id, limit=10)):
+        if row["role"] != "user":
+            return (row["text"] or "").strip() in FEEDBACK_REQUEST_TEXTS
+    return False
+
+
+def parse_bare_rating(text: str) -> tuple[int, str | None] | None:
+    """Parse a reply to the rating request: "5", "5/5", "5 всё отлично" or "⭐⭐⭐⭐⭐"."""
+    stars = text.replace("\ufe0f", "").replace(" ", "")
+    if stars and set(stars) == {"⭐"} and len(stars) <= 5:
+        return len(stars), None
+
+    match = re.match(r"^([1-5])(?:\s*/\s*5)?(?![\d/]|[.,]\d)[\s.,!:\-]*(.*)$", text, re.DOTALL)
+    if not match:
+        return None
+    return int(match.group(1)), match.group(2).strip() or None
+
+
 async def maybe_save_feedback(user: ChatUser, text: str, channel_id: str, chat_type: str) -> bool:
     stripped = text.strip()
     match = re.match(r"^/(?:feedback|review)\s+([1-5])(?:\s+(.*))?$", stripped, re.IGNORECASE)
     if not match:
         match = re.match(r"^(?:оценка|отзыв)\s*[:\-]?\s*([1-5])(?:\s+(.*))?$", stripped, re.IGNORECASE)
 
-    if not match:
-        return False
+    if match:
+        rating = int(match.group(1))
+        comment = match.group(2)
+    else:
+        # A bare "5" is also menu item 5, so it counts as a rating only as the
+        # answer to the rating request.
+        parsed = parse_bare_rating(stripped)
+        if not parsed or not await is_awaiting_feedback(user.id):
+            return False
+        rating, comment = parsed
 
-    rating = int(match.group(1))
-    comment = match.group(2)
     await save_feedback(user.id, rating, comment)
     await log_event(user.id, "feedback", str(rating))
     await wazzup.send_text(
@@ -1107,54 +1111,89 @@ async def maybe_save_feedback(user: ChatUser, text: str, channel_id: str, chat_t
     return True
 
 
-async def run_agent_and_reply(
+async def enqueue_and_reply(
     user: ChatUser,
     channel_id: str,
     chat_type: str,
+    dialog_message_id: int | None,
     user_message: str | None,
-    activity_version: int,
     system_message: str | None = None,
-    ) -> None:
-    conversation = await ensure_conversation(user)
+) -> None:
+    """Queue an inbound message for the agent and answer the queue.
+
+    Messages that arrive while the user's previous batch is still being
+    answered wait on the generation lock and go out together as one turn,
+    so no message is dropped and replies never overlap.
+    """
+    if dialog_message_id is None:
+        return
+    await queue_dialog_message(dialog_message_id, user_message, system_message)
+
+    await asyncio.sleep(RESPONSE_DEBOUNCE_SECONDS)
+    async with generation_lock_for_user(user.id):
+        batch = await claim_new_dialog_messages(user.id)
+        if not batch:
+            # Another task already answered this message as part of its batch.
+            return
+        try:
+            await reply_to_batch(user, channel_id, chat_type, batch)
+        finally:
+            await set_dialog_messages_status([row["id"] for row in batch], "completed")
+
+
+def merge_batch(batch: list[dict[str, Any]]) -> tuple[str | None, str | None]:
+    user_message = "\n".join(row["agent_input"] for row in batch if row.get("agent_input")) or None
+
+    contexts: list[str] = []
+    for row in batch:
+        context = (row.get("agent_context") or "").strip()
+        if context and context not in contexts:
+            contexts.append(context)
+    if len(batch) > 1:
+        contexts.insert(
+            0,
+            "Клиент отправил несколько сообщений подряд. "
+            "Учти их все и ответь одним сообщением.",
+        )
+    return user_message, "\n\n".join(contexts) or None
+
+
+async def reply_to_batch(
+    user: ChatUser,
+    channel_id: str,
+    chat_type: str,
+    batch: list[dict[str, Any]],
+) -> None:
+    if await is_bot_paused(user.id):
+        await log_event(user.id, "queue_skipped_paused", str(len(batch)))
+        return
 
     token_usage = await current_token_usage(user.id)
     token_sum = sum(token_usage.values())
     if token_sum > ABSOLUTE_LIMIT:
         return
 
-    await asyncio.sleep(RESPONSE_DEBOUNCE_SECONDS)
-    if (
-        not await is_latest_activity(user.id, activity_version)
-        or await is_bot_paused(user.id)
-    ):
-        await log_event(user.id, "stale_before_generation", None)
-        return
-
-    exceeded = token_sum > LIMIT_PER_USER
-    if system_message:
-        system_message = system_message.strip()
+    epoch = _user_conversation_epochs.get(user.id, 0)
+    conversation = await ensure_conversation(user)
+    user_message, system_message = merge_batch(batch)
 
     warranty_msg = warranty_assessment_message(user_message or "") if user_message else None
     if warranty_msg:
         system_message = (system_message + "\n\n" if system_message else "") + warranty_msg
 
-    result = await generate_response_serialized(
+    result = await generate_response_with_retry(
         user=user,
         conversation=conversation,
         user_message=user_message,
-        activity_version=activity_version,
         system_message=system_message,
-        exceeded=exceeded,
+        exceeded=token_sum > LIMIT_PER_USER,
     )
     if result is None:
         return
 
     await add_token_usage(user.id, result["input"], result["output"])
 
-    if (
-        not await is_latest_activity(user.id, activity_version)
-        or await is_bot_paused(user.id)
-    ):
+    if _user_conversation_epochs.get(user.id, 0) != epoch or await is_bot_paused(user.id):
         await log_event(user.id, "stale_after_generation", result.get("response_id"))
         return
 
@@ -1170,16 +1209,24 @@ async def run_agent_and_reply(
     if result["data to send"]:
         await handle_completed_request(user, result["data to send"], channel_id, chat_type)
         await log_event(user.id, "lead_created", str(result["data to send"].get("deal_id")))
-        feedback_text = "Оцените, пожалуйста, консультацию от 1 до 5. Можно написать: оценка 5"
-        await wazzup.send_text(user.id, feedback_text, channel_id=channel_id, chat_type=chat_type)
-        await append_dialog_message(user.id, "assistant", "text", feedback_text)
+        await wazzup.send_text(user.id, FEEDBACK_REQUEST_TEXT, channel_id=channel_id, chat_type=chat_type)
+        await append_dialog_message(user.id, "assistant", "text", FEEDBACK_REQUEST_TEXT)
 
     if result.get("handoff"):
         await handle_handoff(user, result["handoff"], channel_id, chat_type)
 
 
-async def reset_conversation(user: ChatUser, channel_id: str, chat_type: str, activity_version: int) -> None:
-    conversation = await new_conversation()
+async def reset_conversation(
+    user: ChatUser,
+    channel_id: str,
+    chat_type: str,
+    dialog_message_id: int | None = None,
+) -> None:
+    _user_conversation_epochs[user.id] = _user_conversation_epochs.get(user.id, 0) + 1
+    if dialog_message_id is not None:
+        await cancel_queued_dialog_messages(user.id, dialog_message_id)
+
+    conversation = await new_conversation(GREETING_TEXT)
     await create_or_update_user(
         user_id=user.id,
         username=user.username,
@@ -1190,10 +1237,6 @@ async def reset_conversation(user: ChatUser, channel_id: str, chat_type: str, ac
     await cancel_open_operator_handoff(user.id)
     await set_bot_paused(user.id, False)
 
-    if not await is_latest_activity(user.id, activity_version):
-        await log_event(user.id, "stale_reset_response", None)
-        return
-
     await wazzup.send_text(user.id, GREETING_TEXT, channel_id=channel_id, chat_type=chat_type)
     await append_dialog_message(user.id, "assistant", "text", GREETING_TEXT)
 
@@ -1203,14 +1246,14 @@ async def handle_command(
     channel_id: str,
     chat_type: str,
     text: str,
-    activity_version: int,
+    dialog_message_id: int | None = None,
 ) -> bool:
     parts = text.strip().split(maxsplit=1)
     command = parts[0].lower()
     args = parts[1] if len(parts) > 1 else ""
 
     if command == "/start":
-        await reset_conversation(user, channel_id, chat_type, activity_version)
+        await reset_conversation(user, channel_id, chat_type, dialog_message_id)
         return True
 
     if command == "/resume":
@@ -1329,25 +1372,25 @@ async def process_text_message(
     message: dict[str, Any],
     channel_id: str,
     chat_type: str,
-    activity_version: int,
+    dialog_message_id: int | None = None,
 ) -> None:
     text = message.get("text") or ""
     if is_customer_greeting(text):
-        await reset_conversation(user, channel_id, chat_type, activity_version)
+        await reset_conversation(user, channel_id, chat_type, dialog_message_id)
         return
 
     if await maybe_save_feedback(user, text, channel_id, chat_type):
         return
 
-    if text.startswith("/") and await handle_command(user, channel_id, chat_type, text, activity_version):
+    if text.startswith("/") and await handle_command(user, channel_id, chat_type, text, dialog_message_id):
         return
 
-    await run_agent_and_reply(
+    await enqueue_and_reply(
         user=user,
         channel_id=channel_id,
         chat_type=chat_type,
+        dialog_message_id=dialog_message_id,
         user_message=text,
-        activity_version=activity_version,
     )
 
 
@@ -1356,7 +1399,7 @@ async def process_image_message(
     message: dict[str, Any],
     channel_id: str,
     chat_type: str,
-    activity_version: int,
+    dialog_message_id: int | None = None,
 ) -> None:
     if await stored_request_media_count(user.id) >= REQUEST_MEDIA_LIMIT:
         await wazzup.send_text(
@@ -1380,19 +1423,19 @@ async def process_image_message(
         "Пользователь только что отправил фото повреждения. "
         "Фото успешно получено и будет прикреплено к заявке. "
         "Спроси клиента: будет ли он отправлять ещё фотографии? "
-        "Если клиент говорит что больше фото не будет — вызови send_contact_details. "
+        "Если клиент говорит, что больше фото не будет, переходи к следующему шагу заявки. "
         "НЕ упоминай техническую сторону (что фото 'направится автоматически' и т.п.) — "
         "просто подтверди получение и спроси про дополнительные фото."
     )
     if photo_analysis:
         system_message += f"\n\n{photo_analysis.as_agent_context()}"
 
-    await run_agent_and_reply(
+    await enqueue_and_reply(
         user=user,
         channel_id=channel_id,
         chat_type=chat_type,
+        dialog_message_id=dialog_message_id,
         user_message=message.get("text"),
-        activity_version=activity_version,
         system_message=system_message,
     )
 
@@ -1402,7 +1445,7 @@ async def process_video_message(
     message: dict[str, Any],
     channel_id: str,
     chat_type: str,
-    activity_version: int,
+    dialog_message_id: int | None = None,
 ) -> None:
     if await stored_request_media_count(user.id) >= REQUEST_MEDIA_LIMIT:
         await wazzup.send_text(
@@ -1419,12 +1462,12 @@ async def process_video_message(
         "Видео успешно получено и будет прикреплено к заявке. "
         "Подтверди получение и спроси, будет ли клиент отправлять ещё фото или видео."
     )
-    await run_agent_and_reply(
+    await enqueue_and_reply(
         user=user,
         channel_id=channel_id,
         chat_type=chat_type,
+        dialog_message_id=dialog_message_id,
         user_message=message.get("text"),
-        activity_version=activity_version,
         system_message=system_message,
     )
 
@@ -1434,7 +1477,7 @@ async def process_audio_message(
     message: dict[str, Any],
     channel_id: str,
     chat_type: str,
-    activity_version: int,
+    dialog_message_id: int | None = None,
 ) -> None:
     content = await store_wazzup_content(user, message, media_type="audio")
     text = None
@@ -1450,12 +1493,12 @@ async def process_audio_message(
     if not text:
         system_message = "Пользователь отправил голосовое сообщение, но его не удалось расшифровать. Попроси отправить аудио ещё раз либо написать текстом"
 
-    await run_agent_and_reply(
+    await enqueue_and_reply(
         user=user,
         channel_id=channel_id,
         chat_type=chat_type,
+        dialog_message_id=dialog_message_id,
         user_message=text,
-        activity_version=activity_version,
         system_message=system_message,
     )
 
@@ -1478,8 +1521,6 @@ async def process_manager_outbound_message(message: dict[str, Any]) -> None:
     )
     if not handoff:
         return
-
-    await record_user_activity(chat_id)
 
     message_type = str(message.get("type") or "unknown")
     text = message.get("text") or f"[{message_type}]"
@@ -1537,6 +1578,7 @@ async def process_wazzup_message(message: dict[str, Any]) -> None:
     message_type = message.get("type")
     message_id = message.get("messageId")
 
+    dialog_message_id = None
     try:
         if message_id:
             is_new = await mark_message_processed(message_id, user.id)
@@ -1544,13 +1586,15 @@ async def process_wazzup_message(message: dict[str, Any]) -> None:
                 return
 
         await log_event(user.id, f"inbound_{message_type}", message_id)
-        await append_dialog_message(
+        # 'preparing' holds the user's agent queue in order until this message
+        # is either queued for the agent or finished without it.
+        dialog_message_id = await append_dialog_message(
             user.id,
             "user",
             message_type or "unknown",
             message.get("text") or f"[{message_type}]",
+            status="preparing",
         )
-        activity_version = await record_user_activity(user.id)
 
         if message_type == "text":
             text = message.get("text") or ""
@@ -1558,22 +1602,22 @@ async def process_wazzup_message(message: dict[str, Any]) -> None:
             if await is_bot_paused(user.id) and not can_restart:
                 await log_event(user.id, "message_while_paused", message_id)
                 return
-            await process_text_message(user, message, channel_id, chat_type, activity_version)
+            await process_text_message(user, message, channel_id, chat_type, dialog_message_id)
         elif message_type == "image":
             if await is_bot_paused(user.id):
                 await log_event(user.id, "message_while_paused", message_id)
                 return
-            await process_image_message(user, message, channel_id, chat_type, activity_version)
+            await process_image_message(user, message, channel_id, chat_type, dialog_message_id)
         elif message_type == "video":
             if await is_bot_paused(user.id):
                 await log_event(user.id, "message_while_paused", message_id)
                 return
-            await process_video_message(user, message, channel_id, chat_type, activity_version)
+            await process_video_message(user, message, channel_id, chat_type, dialog_message_id)
         elif message_type == "audio":
             if await is_bot_paused(user.id):
                 await log_event(user.id, "message_while_paused", message_id)
                 return
-            await process_audio_message(user, message, channel_id, chat_type, activity_version)
+            await process_audio_message(user, message, channel_id, chat_type, dialog_message_id)
         else:
             await wazzup.send_text(
                 user.id,
@@ -1583,6 +1627,16 @@ async def process_wazzup_message(message: dict[str, Any]) -> None:
             )
     except Exception:
         logger.exception("Failed to process Wazzup message %s", message.get("messageId"))
+    finally:
+        # Greetings, ratings, commands, paused chats and failures never reach
+        # the queue; release them so they do not block later messages.
+        if dialog_message_id is not None:
+            try:
+                await set_dialog_messages_status(
+                    [dialog_message_id], "completed", from_status="preparing"
+                )
+            except Exception:
+                logger.exception("Failed to release dialog message %s", dialog_message_id)
 
 
 @app.get("/admin")

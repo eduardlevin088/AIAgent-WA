@@ -415,6 +415,12 @@ async def create_tables():
             created_at TIMESTAMPTZ DEFAULT NOW()
         )
     """)
+    # Agent queue for inbound customer messages: preparing -> new -> processing
+    # -> completed. agent_input/agent_context are what the LLM receives as the
+    # user text and the system note; rows without a status are plain log.
+    await ensure_column("dialog_messages", "status", "status TEXT")
+    await ensure_column("dialog_messages", "agent_input", "agent_input TEXT")
+    await ensure_column("dialog_messages", "agent_context", "agent_context TEXT")
 
     await db.execute("""
         CREATE TABLE IF NOT EXISTS feedback (
@@ -1248,14 +1254,120 @@ async def append_dialog_message(
     role: str,
     message_type: str,
     text: str | None = None,
+    status: str | None = None,
+) -> int | None:
+    if db is None:
+        raise RuntimeError("Database not initialized")
+
+    cursor = await db.execute("""
+        INSERT INTO dialog_messages (user_id, role, message_type, text, status)
+        VALUES (?, ?, ?, ?, ?)
+        RETURNING id
+    """, (user_id, role, message_type, text, status))
+    row = await cursor.fetchone()
+    await db.commit()
+    return int(row[0]) if row else None
+
+
+async def queue_dialog_message(
+    message_id: int,
+    agent_input: str | None,
+    agent_context: str | None = None,
 ) -> None:
+    """Hand a prepared inbound message to the agent queue."""
     if db is None:
         raise RuntimeError("Database not initialized")
 
     await db.execute("""
-        INSERT INTO dialog_messages (user_id, role, message_type, text)
-        VALUES (?, ?, ?, ?)
-    """, (user_id, role, message_type, text))
+        UPDATE dialog_messages
+        SET status = 'new', agent_input = ?, agent_context = ?
+        WHERE id = ?
+    """, (agent_input, agent_context, message_id))
+    await db.commit()
+
+
+async def set_dialog_messages_status(
+    message_ids: Sequence[int],
+    status: str,
+    from_status: str | None = None,
+) -> None:
+    if db is None:
+        raise RuntimeError("Database not initialized")
+    if not message_ids:
+        return
+
+    placeholders = ", ".join("?" for _ in message_ids)
+    params: list = [status, *message_ids]
+    status_filter = ""
+    if from_status:
+        status_filter = " AND status = ?"
+        params.append(from_status)
+    await db.execute(f"""
+        UPDATE dialog_messages
+        SET status = ?
+        WHERE id IN ({placeholders}){status_filter}
+    """, params)
+    await db.commit()
+
+
+async def claim_new_dialog_messages(user_id: str) -> list[dict]:
+    """Move the user's queued messages to 'processing' and return them oldest first.
+
+    Stops before the first message still being prepared (photo analysis,
+    transcription), so the batch never jumps ahead of an earlier message.
+    """
+    if db is None:
+        raise RuntimeError("Database not initialized")
+
+    async with db.execute("""
+        UPDATE dialog_messages
+        SET status = 'processing'
+        WHERE user_id = ?
+          AND status = 'new'
+          AND id < COALESCE(
+              (SELECT MIN(id) FROM dialog_messages WHERE user_id = ? AND status = 'preparing'),
+              2147483647
+          )
+        RETURNING id, agent_input, agent_context
+    """, (user_id, user_id)) as cursor:
+        rows = await cursor.fetchall()
+    await db.commit()
+
+    return sorted((dict(row) for row in rows), key=lambda row: row["id"])
+
+
+async def cancel_queued_dialog_messages(user_id: str, before_id: int) -> None:
+    """Drop queued messages sent before a dialogue restart."""
+    if db is None:
+        raise RuntimeError("Database not initialized")
+
+    await db.execute("""
+        UPDATE dialog_messages
+        SET status = 'completed'
+        WHERE user_id = ? AND id < ? AND status IN ('preparing', 'new')
+    """, (user_id, before_id))
+    await db.commit()
+
+
+async def requeue_unfinished_dialog_messages() -> None:
+    """Return messages interrupted by a restart to the queue.
+
+    Messages still being prepared have no agent input yet, so they are
+    closed instead of queued; they would otherwise block the user's queue.
+    """
+    if db is None:
+        raise RuntimeError("Database not initialized")
+
+    await db.execute("""
+        UPDATE dialog_messages
+        SET status = 'new'
+        WHERE status = 'processing'
+    """)
+    await db.execute("""
+        UPDATE dialog_messages
+        SET status = 'completed'
+        WHERE status = 'preparing'
+    """)
     await db.commit()
 
 

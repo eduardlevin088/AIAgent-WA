@@ -444,6 +444,7 @@ def find_bitrix_client_deals(phone: str) -> list[dict]:
     return [
         {
             "deal_id": int(item["id"]),
+            "stage_id": str(item.get("stageId") or ""),
             "status": BITRIX_STAGE_STATUS_MAP.get(str(item.get("stageId")), "Неизвестен"),
             "created": str(item.get("createdTime") or "")[:10],
             "number": item.get(BITRIX_DEAL_NUMBER_FIELD) or None,

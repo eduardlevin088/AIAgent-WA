@@ -23,9 +23,9 @@ class GreetingTests(unittest.IsolatedAsyncioTestCase):
             first_name="Customer",
         )
         original_reset = bot.reset_conversation
-        original_run_agent = bot.run_agent_and_reply
+        original_enqueue = bot.enqueue_and_reply
         bot.reset_conversation = AsyncMock()
-        bot.run_agent_and_reply = AsyncMock()
+        bot.enqueue_and_reply = AsyncMock()
         try:
             await bot.process_text_message(
                 user,
@@ -35,7 +35,7 @@ class GreetingTests(unittest.IsolatedAsyncioTestCase):
                 1,
             )
             bot.reset_conversation.assert_awaited_once()
-            bot.run_agent_and_reply.assert_not_awaited()
+            bot.enqueue_and_reply.assert_not_awaited()
 
             bot.reset_conversation.reset_mock()
             await bot.process_text_message(
@@ -46,7 +46,7 @@ class GreetingTests(unittest.IsolatedAsyncioTestCase):
                 2,
             )
             bot.reset_conversation.assert_awaited_once()
-            bot.run_agent_and_reply.assert_not_awaited()
+            bot.enqueue_and_reply.assert_not_awaited()
 
             bot.reset_conversation.reset_mock()
             await bot.process_text_message(
@@ -58,12 +58,12 @@ class GreetingTests(unittest.IsolatedAsyncioTestCase):
             )
             bot.reset_conversation.assert_not_awaited()
             self.assertEqual(
-                bot.run_agent_and_reply.await_args.kwargs["user_message"],
+                bot.enqueue_and_reply.await_args.kwargs["user_message"],
                 "Здравствуйте, сломался замок",
             )
         finally:
             bot.reset_conversation = original_reset
-            bot.run_agent_and_reply = original_run_agent
+            bot.enqueue_and_reply = original_enqueue
 
     async def test_reset_conversation_sends_locked_greeting_without_llm(self):
         user = bot.ChatUser(
@@ -72,23 +72,23 @@ class GreetingTests(unittest.IsolatedAsyncioTestCase):
             first_name="Customer",
         )
         with (
-            unittest.mock.patch.object(bot, "new_conversation", AsyncMock(return_value="conv-1")),
+            unittest.mock.patch.object(bot, "new_conversation", AsyncMock(return_value="conv-1")) as new_conversation_mock,
             unittest.mock.patch.object(bot, "create_or_update_user", AsyncMock()),
             unittest.mock.patch.object(bot, "cancel_open_operator_handoff", AsyncMock()),
             unittest.mock.patch.object(bot, "set_bot_paused", AsyncMock()),
-            unittest.mock.patch.object(bot, "is_latest_activity", AsyncMock(return_value=True)),
             unittest.mock.patch.object(bot, "append_dialog_message", AsyncMock()) as append_message,
-            unittest.mock.patch.object(bot, "generate_response_serialized", AsyncMock()) as generate,
+            unittest.mock.patch.object(bot, "generate_response_with_retry", AsyncMock()) as generate,
             unittest.mock.patch.object(bot.wazzup, "send_text", AsyncMock()) as send_text,
         ):
             await bot.reset_conversation(
                 user,
                 "test-channel",
                 "whatsapp",
-                activity_version=1,
             )
 
         generate.assert_not_awaited()
+        # The model must see the greeting, or it greets the customer again.
+        new_conversation_mock.assert_awaited_once_with(bot.GREETING_TEXT)
         send_text.assert_awaited_once_with(
             user.id,
             bot.GREETING_TEXT,
