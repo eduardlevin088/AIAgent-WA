@@ -7,7 +7,6 @@ from .miscellaneous import current_time_utc_offset, is_manager_working_time
 from .integrations import create_bitrix_lead, find_bitrix_client_deals
 from .integrations import repair_request_title, update_bitrix_repair_request_number
 from database import create_repair_request, get_bitrix_id, set_bitrix_id, run_coro_on_db_loop
-from database import get_request_numbers_by_deal_ids
 from .service_centers import service_centers_prompt_text
 import json
 import logging
@@ -206,7 +205,11 @@ def send_contact_details(data: dict, username: str, user_id: str) -> tuple[str, 
 
     if result["bitrix_id"]:
         run_coro_on_db_loop(set_bitrix_id(user_id, result["bitrix_id"]))
-    return f"Заявка создана в CRM. Номер заявки: {request_number}", data
+    return (
+        "Заявка создана в CRM. Номер заявки клиенту не называй: его присвоит сервисный центр, "
+        "а узнать его клиент сможет через «Статус заказа».",
+        data,
+    )
 
 
 def get_client_applications(phone: str) -> str:
@@ -231,17 +234,11 @@ def get_client_applications(phone: str) -> str:
         )
 
     deals = deals[:MAX_CLIENT_APPLICATIONS]
-    try:
-        request_numbers = run_coro_on_db_loop(
-            get_request_numbers_by_deal_ids([deal["deal_id"] for deal in deals])
-        )
-    except Exception:
-        logger.exception("Failed to load request numbers for client deals")
-        request_numbers = {}
-
+    # The customer-facing number is assigned in Bitrix; the bot's own request
+    # number is internal and never shown to the customer.
     applications = [
         {
-            "number": deal["number"] or request_numbers.get(deal["deal_id"]),
+            "number": deal["number"],
             "status": deal["status"],
             "created": deal["created"],
         }

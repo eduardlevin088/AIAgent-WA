@@ -151,7 +151,7 @@ class GetClientApplicationsTests(unittest.TestCase):
          "created": "2026-05-01", "number": "11557"},
     ]
 
-    def run_tool(self, arguments, deals=None, request_numbers=None):
+    def run_tool(self, arguments, deals=None):
         fake = FakeResponses([
             response([function_call("call_a", "get_client_applications", arguments)]),
             response([message()], "ок"),
@@ -159,9 +159,7 @@ class GetClientApplicationsTests(unittest.TestCase):
         with patch.object(agent, "client", SimpleNamespace(responses=fake)), \
                 patch.object(agent, "find_bitrix_client_deals",
                              side_effect=agent.find_bitrix_client_deals if deals is None
-                             else lambda phone: deals) as find, \
-                patch.object(agent, "run_coro_on_db_loop",
-                             side_effect=lambda coro: coro.close() or (request_numbers or {})):
+                             else lambda phone: deals) as find:
             agent.generate_response(
                 user_message="Статус заказа",
                 conversation="conv_test",
@@ -181,10 +179,10 @@ class GetClientApplicationsTests(unittest.TestCase):
         self.assertIn("не найдены", output)
 
     def test_returns_statuses_with_numbers(self):
-        _, output = self.run_tool({}, deals=self.DEALS, request_numbers={3: 57})
+        _, output = self.run_tool({}, deals=self.DEALS)
         applications = json.loads(output)["applications"]
-        # The Bitrix number wins; the bot's own number fills in where it is empty.
-        self.assertEqual([57, "11560"], [a["number"] for a in applications])
+        # Only the Bitrix number reaches the customer, even when it is empty.
+        self.assertEqual([None, "11560"], [a["number"] for a in applications])
         self.assertEqual(["Готов", "В работе"], [a["status"] for a in applications])
         self.assertNotIn("description", applications[0])
 
@@ -264,7 +262,6 @@ class RequestConfirmationTests(unittest.TestCase):
         create.assert_called_once()
         self.assertNotIn("confirmed", create.call_args.kwargs["data"])
         self.assertEqual({"deal_id": 1}, result["data to send"])
-        self.assertIn("10509", output)
 
     def test_summary_from_another_conversation_does_not_count(self):
         self.turn(False, conversation="conv_old")
@@ -279,7 +276,7 @@ class ComplaintTitleTests(unittest.TestCase):
                 patch.object(agent, "update_bitrix_repair_request_number") as update, \
                 patch.object(agent, "run_coro_on_db_loop",
                              side_effect=lambda coro: coro.close() or 42):
-            agent.send_contact_details(data=data, username="tester", user_id="77000000000")
+            self.message, _ = agent.send_contact_details(data=data, username="tester", user_id="77000000000")
         return update.call_args.args
 
     def test_regular_application_title(self):
@@ -287,6 +284,11 @@ class ComplaintTitleTests(unittest.TestCase):
 
     def test_complaint_title(self):
         self.assertEqual((5, 42, "ТЕСТ Жалоба"), self.create({"complaint": True}))
+
+    def test_internal_number_is_not_given_to_the_model(self):
+        self.create({"complaint": False})
+        # The customer-facing number is assigned in Bitrix, not by the bot.
+        self.assertNotIn("42", self.message)
 
 
 if __name__ == "__main__":
