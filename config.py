@@ -67,6 +67,7 @@ STATIC_DIR = BASE_DIR / "static"
 AGENT_PROMPT_MAIN_PATH = STATIC_DIR / "agent_prompt_main.txt"
 WARRANTY_RULES_PATH = STATIC_DIR / "warranty_rules.txt"
 GREETING_TEXT_PATH = STATIC_DIR / "greeting.txt"
+SERVICE_CENTERS_PATH = STATIC_DIR / "service_centers.json"
 PHOTO_PROCESSING_INSTRUCTIONS_PATH = Path(
     os.getenv("PHOTO_PROCESSING_INSTRUCTIONS_PATH") or STATIC_DIR / "photo_processing_instructions.txt"
 )

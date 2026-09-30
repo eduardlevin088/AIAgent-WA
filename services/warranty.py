@@ -5,9 +5,9 @@ from dataclasses import dataclass
 
 @dataclass
 class WarrantyAssessment:
-    is_likely_warranty: bool | None
-    reason: str
-    required_documents: list[str]
+    is_warranty_question: bool
+    exclusions: list[str]
+    wear_parts: list[str]
     conclusion: str
 
 
@@ -17,6 +17,7 @@ _NON_WARRANTY_KEYWORDS = [
     "пад",
     "перегруз",
     "перевоз",
+    "аэропорт",
     "износ",
     "порез",
     "прокол",
@@ -30,13 +31,21 @@ _NON_WARRANTY_KEYWORDS = [
 ]
 
 
-_GUARANTEE_REQUIRED_DOCS_KEYWORDS = [
-    "чек",
-    "квитанц",
-    "талон",
-    "чек-касс",
-    "гарантийный талон",
+# Hardware that wears out in normal use; its failure is usually not a
+# manufacturing defect.
+_WEAR_PART_KEYWORDS = [
+    "колес",
+    "колёс",
+    "ручк",
+    "молни",
+    "замок",
+    "замк",
+    "бегун",
+    "собачк",
 ]
+
+
+_REQUIRED_DOCUMENTS = "чек или другой документ о покупке и гарантийный талон"
 
 
 def _text_norm(value: str) -> str:
@@ -47,69 +56,50 @@ def assess_warranty_from_message(message: str) -> WarrantyAssessment:
     normalized = _text_norm(message)
     if "гарант" not in normalized:
         return WarrantyAssessment(
-            is_likely_warranty=None,
-            reason="",
-            required_documents=[],
+            is_warranty_question=False,
+            exclusions=[],
+            wear_parts=[],
             conclusion="",
         )
 
-    found_non_warranty = [
-        keyword
-        for keyword in _NON_WARRANTY_KEYWORDS
-        if keyword in normalized
-    ]
+    exclusions = [keyword for keyword in _NON_WARRANTY_KEYWORDS if keyword in normalized]
+    wear_parts = [keyword for keyword in _WEAR_PART_KEYWORDS if keyword in normalized]
 
-    required_documents: list[str] = [
-        "чек/документ о покупке",
-        "гарантийный талон",
-    ]
-
-    if found_non_warranty:
-        reasons = ", ".join(found_non_warranty)
-        return WarrantyAssessment(
-            is_likely_warranty=False,
-            reason=(
-                "В описании есть признаки, которые по правилам не покрываются гарантией: "
-                f"{reasons}."
-            ),
-            required_documents=required_documents,
-            conclusion=(
-                "Предварительная оценка: вероятно, это не гарантийный случай. "
-                "После диагностики менеджер может подтвердить отказ или оплатный характер ремонта."
-            ),
+    if exclusions:
+        conclusion = (
+            "В описании есть признаки, которые гарантия не покрывает "
+            f"({', '.join(exclusions)}). Предварительно: скорее всего, это не гарантийный случай."
         )
-
-    docs_present = any(keyword in normalized for keyword in _GUARANTEE_REQUIRED_DOCS_KEYWORDS)
-    conclusion = (
-        "По описанию явных исключений не видно. "
-        "Предварительно можно считать случай потенциально гарантийным, "
-        "если есть покупной документ и/или гарантийный талон. "
-        "Окончательно решение — после диагностики в сервисном центре."
-    )
-    if not docs_present:
-        conclusion += (
-            " Требуются документы для подтверждения: чек/документ о покупке и гарантийный талон, "
-            "иначе возможен платный ремонт."
+    elif wear_parts:
+        conclusion = (
+            "Речь об изнашиваемой фурнитуре (колёса, ручки, молнии, замки). "
+            "Её поломка обычно не является гарантийным случаем."
         )
-        "иначе возможен платный ремонт."
+    else:
+        conclusion = (
+            "Гарантия распространяется только на производственные дефекты. "
+            "Является ли случай гарантийным, по переписке определить нельзя."
+        )
 
     return WarrantyAssessment(
-        is_likely_warranty=True,
-        reason="Явные основания для отказа по гарантии не указаны.",
-        required_documents=required_documents,
+        is_warranty_question=True,
+        exclusions=exclusions,
+        wear_parts=wear_parts,
         conclusion=conclusion,
     )
 
 
 def warranty_assessment_message(message: str) -> str | None:
     assessment = assess_warranty_from_message(message)
-    if assessment.is_likely_warranty is None:
+    if not assessment.is_warranty_question:
         return None
 
-    docs = ", ".join(assessment.required_documents)
     return (
-        "Оценка по гарантии (предварительная, до диагностики):\n"
+        "Клиент спрашивает о гарантии.\n"
         f"{assessment.conclusion}\n"
-        f"Основание: {assessment.reason}\n"
-        f"Документы, которые нужно уточнить: {docs}."
+        "Не говори, что случай может быть или будет признан гарантийным, и не обещай "
+        "бесплатный ремонт — даже если у клиента есть чек и гарантийный талон. "
+        "Наличие документов не делает случай гарантийным.\n"
+        "Решение о гарантии принимает только сервисный центр после диагностики. "
+        f"Для обращения по гарантии понадобятся: {_REQUIRED_DOCUMENTS}."
     )
