@@ -13,7 +13,7 @@ os.environ.setdefault("ABSOLUTE_LIMIT", "200000")
 os.environ.setdefault("KZ_UTC", "5")
 os.environ.setdefault("WAZZUP_CHANNEL_ID", "test-channel")
 
-from services import agent
+from services import agent, integrations
 
 
 def usage():
@@ -270,25 +270,26 @@ class RequestConfirmationTests(unittest.TestCase):
 
 
 class ComplaintTitleTests(unittest.TestCase):
-    def create(self, data):
-        with patch.object(agent, "create_bitrix_lead",
-                          return_value={"deal_id": 5, "bitrix_id": 7}), \
-                patch.object(agent, "update_bitrix_repair_request_number") as update, \
-                patch.object(agent, "run_coro_on_db_loop",
-                             side_effect=lambda coro: coro.close() or 42):
-            self.message, _ = agent.send_contact_details(data=data, username="tester", user_id="77000000000")
-        return update.call_args.args
-
     def test_regular_application_title(self):
-        self.assertEqual((5, 42, "ТЕСТ Заявка на ремонт"), self.create({"complaint": False}))
+        self.assertEqual("ТЕСТ Заявка на ремонт", integrations.repair_request_title({"complaint": False}))
 
     def test_complaint_title(self):
-        self.assertEqual((5, 42, "ТЕСТ Жалоба"), self.create({"complaint": True}))
+        self.assertEqual("ТЕСТ Жалоба", integrations.repair_request_title({"complaint": True}))
 
-    def test_internal_number_is_not_given_to_the_model(self):
-        self.create({"complaint": False})
-        # The customer-facing number is assigned in Bitrix, not by the bot.
-        self.assertNotIn("42", self.message)
+
+class SendContactDetailsTests(unittest.TestCase):
+    def test_no_application_number_is_generated_or_announced(self):
+        with patch.object(agent, "create_bitrix_lead",
+                          return_value={"deal_id": 5, "bitrix_id": 7}), \
+                patch.object(agent, "run_coro_on_db_loop",
+                             side_effect=lambda coro: coro.close() or 42):
+            message, data = agent.send_contact_details(
+                data={"complaint": False}, username="tester", user_id="77000000000"
+            )
+        # The application number is assigned in Bitrix, not by the bot.
+        self.assertNotIn("request_number", data)
+        self.assertNotIn("42", message)
+        self.assertEqual(5, data["deal_id"])
 
 
 if __name__ == "__main__":

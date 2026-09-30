@@ -590,7 +590,7 @@ async def notify_customer_about_bitrix_status(
     if not user_id or not new_status:
         return False
 
-    request_number = application.get("request_number")
+    deal_id = application.get("deal_id")
     text = await get_notification_template_text(stage_id)
     if not text:
         return False
@@ -603,14 +603,14 @@ async def notify_customer_about_bitrix_status(
         )
     except Exception:
         logger.exception(
-            "Failed to send Bitrix status notification for request %s to %s",
-            request_number,
+            "Failed to send Bitrix status notification for deal %s to %s",
+            deal_id,
             user_id,
         )
         return False
 
     await append_dialog_message(str(user_id), "assistant", "status", text)
-    await log_event(str(user_id), "bitrix_status_notification_sent", str(request_number or ""))
+    await log_event(str(user_id), "bitrix_status_notification_sent", str(deal_id or ""))
     return True
 
 
@@ -997,10 +997,10 @@ def format_handoff_card(
     if city:
         lines.append(f"Город: {city}")
 
-    request_number = request.get("request_number")
-    if request_number:
+    if request.get("created_at"):
         status = clean(request.get("status"))
-        lines.append(f"Заявка: #{request_number}{f' ({status})' if status else ''}")
+        deal = f"сделка Bitrix {request['deal_id']}" if request.get("deal_id") else "оформлена"
+        lines.append(f"Заявка: {deal}{f' ({status})' if status else ''}")
     else:
         lines.append("Заявка: не оформлена")
 
@@ -1853,7 +1853,6 @@ async def admin_statistics_export(request: Request) -> Response:
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow([
-        "request_number",
         "status",
         "name",
         "phone",
@@ -1871,7 +1870,6 @@ async def admin_statistics_export(request: Request) -> Response:
     ])
     for application in applications:
         writer.writerow([
-            application.get("request_number") or application.get("id"),
             application.get("status") or "",
             application.get("name") or "",
             application.get("phone") or "",
@@ -2687,7 +2685,6 @@ async def bitrix_webhook(request: Request) -> dict[str, Any]:
         "furthest_stage_rank": sync_result.get("furthest_stage_rank"),
         "updated": sync_result.get("updated"),
         "notification_sent": notification_sent,
-        "request_number": application.get("request_number") if application else None,
         "user_id": application.get("user_id") if application else None,
         "payload_keys": sorted(payload.keys()),
     }
@@ -2716,7 +2713,6 @@ async def bitrix_webhook(request: Request) -> dict[str, Any]:
         "furthestStageId": sync_result.get("furthest_stage_id"),
         "updated": sync_result.get("updated"),
         "notificationSent": notification_sent,
-        "requestNumber": application.get("request_number") if application else None,
     }
 
 

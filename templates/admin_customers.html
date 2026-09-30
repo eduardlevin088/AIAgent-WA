@@ -156,8 +156,8 @@
                                 <td>{{ customer.city or "не указан" }}</td>
                                 <td>{{ customer.requests_count or 0 }}</td>
                                 <td>
-                                    {% if customer.last_request_number %}
-                                        <div class="strong">№{{ customer.last_request_number }}</div>
+                                    {% if customer.last_request_at %}
+                                        <div class="strong">{% if customer.last_deal_id %}Сделка {{ customer.last_deal_id }}{% else %}Без сделки{% endif %}</div>
                                         <span class="status-pill">{{ customer.last_status or "Без статуса" }}</span>
                                     {% else %}
                                         <span class="small">заявок нет</span>

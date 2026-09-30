@@ -314,7 +314,7 @@
                                         <article class="lead-card">
                                             <div class="lead-top">
                                                 <div>
-                                                    <div class="request-number">№{{ app.request_number or app.id }}</div>
+                                                    <div class="request-number">{% if app.deal_id %}Сделка {{ app.deal_id }}{% else %}Без сделки{% endif %}</div>
                                                     <div class="small">WA {{ app.user_id or "не указан" }}</div>
                                                 </div>
                                                 <time class="lead-date">{{ app.created_at }}</time>
