@@ -172,6 +172,11 @@ tools = [
 ]
 
 
+def forget_summary_request(conversation: str) -> None:
+    """The summary was generated but never delivered, so it cannot be confirmed."""
+    _summary_requested_conversations.discard(conversation)
+
+
 def transcribe(voice_buffer: BytesIO) -> str:
     try:
         response = client.audio.transcriptions.create(
@@ -271,7 +276,8 @@ def generate_response(user_message: str | None,
             "input": input_tokens,
             "cache": cache_tokens,
             "output": output_tokens,
-            "response_id": response.id if response else None
+            "response_id": response.id if response else None,
+            "summary_requested": summary_requested_this_turn,
         }
 
     instructions = (

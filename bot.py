@@ -26,6 +26,7 @@ from config import MANAGER_LOG_CLEANUP_INTERVAL_SECONDS
 from config import SUPERADMIN_ID, WAZZUP_CHANNEL_ID, WAZZUP_CHAT_LINK_BASE, WAZZUP_CHAT_TYPE
 from database import add_token_usage, append_dialog_message, cancel_open_operator_handoff
 from database import cancel_queued_dialog_messages, claim_new_dialog_messages
+from database import has_queued_dialog_messages
 from database import queue_dialog_message, requeue_unfinished_dialog_messages
 from database import set_dialog_messages_status
 from database import close_db, close_expired_operator_handoffs, complete_customer_segment_job
@@ -54,7 +55,7 @@ from database import save_media_file, set_bot_paused, set_handoff_recipients
 from database import sync_repair_request_status_by_deal_id
 from database import update_admin_user
 from database import update_notification_templates
-from services.agent import generate_response, transcribe
+from services.agent import forget_summary_request, generate_response, transcribe
 from services.admin_auth import hash_password, sign_session, verify_password, verify_session
 from services.integrations import build_bitrix_customer_segment, get_bitrix_deal_stage_id
 from services.integrations import list_bitrix_deal_categories, list_bitrix_deal_stages_by_category
@@ -78,6 +79,7 @@ GREETING_TEXT = GREETING_TEXT_PATH.read_text(encoding="utf-8").strip()
 # The chat accepts any number of photos/videos; only the first ones go to the Bitrix deal.
 BITRIX_MEDIA_LIMIT = 5
 FEEDBACK_REQUEST_TEXT = "Оцените, пожалуйста, консультацию: напишите цифру от 1 до 5."
+FEEDBACK_THANKS_TEXT = "Спасибо за оценку. Отзыв зафиксирован."
 # Includes the earlier wording, so requests sent before a deploy still count.
 FEEDBACK_REQUEST_TEXTS = {
     FEEDBACK_REQUEST_TEXT,
@@ -91,6 +93,15 @@ _user_generation_locks: dict[str, asyncio.Lock] = {}
 # Bumped on every dialogue restart, so a reply generated on the old
 # conversation is not sent after the greeting.
 _user_conversation_epochs: dict[str, int] = {}
+# Users whose last generated reply was dropped because they wrote again while it
+# was being generated; their next turn tells the model so.
+_user_superseded_replies: set[str] = set()
+# o4-mini occasionally slips CJK characters into Russian text ("для确认").
+CJK_CHARACTERS = re.compile(r"[\u2e80-\u9fff\uac00-\ud7af\uf900-\ufaff\uff00-\uffef]+")
+SUPERSEDED_REPLY_NOTE = (
+    "Твой предыдущий ответ не был отправлен клиенту: пока ты его готовил, клиент написал ещё. "
+    "Клиент его не видел. Ответь заново одним сообщением с учётом всех сообщений клиента."
+)
 CUSTOMER_GREETING_PHRASES = {
     "ассаламу алейкум",
     "ассалаумагалейкум",
@@ -1067,10 +1078,15 @@ async def handle_handoff(
 
 
 async def is_awaiting_feedback(user_id: str) -> bool:
-    """True while the bot's latest message to the user is the rating request."""
+    """True after the rating request until a rating is saved or the dialogue restarts."""
     for row in reversed(await get_recent_dialog(user_id, limit=10)):
-        if row["role"] != "user":
-            return (row["text"] or "").strip() in FEEDBACK_REQUEST_TEXTS
+        if row["role"] == "user":
+            continue
+        text = (row["text"] or "").strip()
+        if text in FEEDBACK_REQUEST_TEXTS:
+            return True
+        if text in (FEEDBACK_THANKS_TEXT, GREETING_TEXT):
+            return False
     return False
 
 
@@ -1107,11 +1123,11 @@ async def maybe_save_feedback(user: ChatUser, text: str, channel_id: str, chat_t
     await log_event(user.id, "feedback", str(rating))
     await wazzup.send_text(
         user.id,
-        "Спасибо за оценку. Отзыв зафиксирован.",
+        FEEDBACK_THANKS_TEXT,
         channel_id=channel_id,
         chat_type=chat_type,
     )
-    await append_dialog_message(user.id, "assistant", "text", "Спасибо за оценку. Отзыв зафиксирован.")
+    await append_dialog_message(user.id, "assistant", "text", FEEDBACK_THANKS_TEXT)
     return True
 
 
@@ -1180,6 +1196,10 @@ async def reply_to_batch(
     epoch = _user_conversation_epochs.get(user.id, 0)
     conversation = await ensure_conversation(user)
     user_message, system_message = merge_batch(batch)
+    superseded = user.id in _user_superseded_replies
+    _user_superseded_replies.discard(user.id)
+    if superseded:
+        system_message = SUPERSEDED_REPLY_NOTE + ("\n\n" + system_message if system_message else "")
 
     warranty_msg = warranty_assessment_message(user_message or "") if user_message else None
     if warranty_msg:
@@ -1201,14 +1221,35 @@ async def reply_to_batch(
         await log_event(user.id, "stale_after_generation", result.get("response_id"))
         return
 
-    if result["response"]:
+    # A reply to part of what the customer wrote reads as ignoring the rest (or
+    # as confirming a summary they have not seen yet), so answer everything at
+    # once instead. Replies that created a request or a handoff are always sent,
+    # and a reply is dropped at most once in a row so a fast typist still gets one.
+    if (
+        not superseded
+        and not result["data to send"]
+        and not result.get("handoff")
+        and await has_queued_dialog_messages(user.id)
+    ):
+        _user_superseded_replies.add(user.id)
+        if result.get("summary_requested"):
+            forget_summary_request(conversation)
+        await log_event(user.id, "reply_superseded", result.get("response_id"))
+        return
+
+    response_text = result["response"]
+    if response_text and CJK_CHARACTERS.search(response_text):
+        await log_event(user.id, "cjk_removed_from_reply", result.get("response_id"))
+        response_text = re.sub(r"[ \t]{2,}", " ", CJK_CHARACTERS.sub("", response_text))
+
+    if response_text:
         await wazzup.send_text(
             chat_id=user.id,
-            text=result["response"],
+            text=response_text,
             channel_id=channel_id,
             chat_type=chat_type,
         )
-        await append_dialog_message(user.id, "assistant", "text", result["response"])
+        await append_dialog_message(user.id, "assistant", "text", response_text)
 
     if result["data to send"]:
         await handle_completed_request(user, result["data to send"], channel_id, chat_type)
@@ -1230,6 +1271,7 @@ async def reset_conversation(
     dialog_message_id: int | None = None,
 ) -> None:
     _user_conversation_epochs[user.id] = _user_conversation_epochs.get(user.id, 0) + 1
+    _user_superseded_replies.discard(user.id)
     if dialog_message_id is not None:
         await cancel_queued_dialog_messages(user.id, dialog_message_id)
     await clear_media_files(user.id)

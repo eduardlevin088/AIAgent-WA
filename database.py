@@ -1307,6 +1307,19 @@ async def claim_new_dialog_messages(user_id: str) -> list[dict]:
     return sorted((dict(row) for row in rows), key=lambda row: row["id"])
 
 
+async def has_queued_dialog_messages(user_id: str) -> bool:
+    """True when the user sent something that has not been answered yet."""
+    if db is None:
+        raise RuntimeError("Database not initialized")
+
+    async with db.execute("""
+        SELECT 1 FROM dialog_messages
+        WHERE user_id = ? AND status IN ('preparing', 'new')
+        LIMIT 1
+    """, (user_id,)) as cursor:
+        return await cursor.fetchone() is not None
+
+
 async def cancel_queued_dialog_messages(user_id: str, before_id: int) -> None:
     """Drop queued messages sent before a dialogue restart."""
     if db is None:

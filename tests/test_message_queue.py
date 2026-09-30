@@ -59,6 +59,7 @@ class MessageQueueTests(unittest.IsolatedAsyncioTestCase):
 
         bot._user_generation_locks.clear()
         bot._user_conversation_epochs.clear()
+        bot._user_superseded_replies.clear()
         self.sent: list[str] = []
 
         async def send_text(chat_id, text, **kwargs):
@@ -108,12 +109,14 @@ class MessageQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.sent, ["Ответ"])
         self.assertEqual(await self.statuses(), ["completed", "completed"])
 
-    async def test_message_during_generation_waits_and_is_answered_next(self):
+    async def test_message_during_generation_supersedes_the_unsent_reply(self):
         release_first = asyncio.Event()
         calls: list[str] = []
+        notes: list[str | None] = []
 
         async def generate(**kwargs):
             calls.append(kwargs["user_message"])
+            notes.append(kwargs["system_message"])
             if len(calls) == 1:
                 await release_first.wait()
             return agent_result(f"Ответ на {kwargs['user_message']}")
@@ -135,7 +138,44 @@ class MessageQueueTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.gather(first_task, second_task)
 
         self.assertEqual(calls, ["Ручка сломалась", "Переносная"])
-        self.assertEqual(self.sent, ["Ответ на Ручка сломалась", "Ответ на Переносная"])
+        # The first reply answered only part of what the customer wrote, so it is
+        # dropped and the model is told the customer never saw it.
+        self.assertEqual(self.sent, ["Ответ на Переносная"])
+        self.assertIn("не был отправлен", notes[1])
+        self.assertNotIn(USER.id, bot._user_superseded_replies)
+
+    async def superseded_twice(self, result):
+        """Generate while a newer message is always waiting; return what was sent."""
+        await self.inbound("x", status="new")
+        with patch.object(bot, "generate_response_with_retry", AsyncMock(return_value=result)):
+            await bot.reply_to_batch(USER, "c", "whatsapp", [{"id": 0, "agent_input": "a"}])
+            await bot.reply_to_batch(USER, "c", "whatsapp", [{"id": 0, "agent_input": "b"}])
+        return self.sent
+
+    async def test_reply_is_dropped_at_most_once_in_a_row(self):
+        self.assertEqual(["Ответ"], await self.superseded_twice(agent_result("Ответ")))
+
+    async def test_reply_that_created_a_request_is_never_dropped(self):
+        result = {**agent_result("Заявка принята."), "data to send": {"deal_id": 1, "city": "Астана"}}
+        with patch.object(bot, "handle_completed_request", AsyncMock()), \
+                patch.object(bot, "log_event", AsyncMock()):
+            sent = await self.superseded_twice(result)
+        self.assertEqual("Заявка принята.", sent[0])
+
+    async def test_dropped_summary_cannot_be_confirmed(self):
+        await self.inbound("x", status="new")
+        result = {**agent_result("Проверьте данные"), "summary_requested": True}
+        with patch.object(bot, "generate_response_with_retry", AsyncMock(return_value=result)), \
+                patch.object(bot, "forget_summary_request") as forget:
+            await bot.reply_to_batch(USER, "c", "whatsapp", [{"id": 0, "agent_input": "a"}])
+        forget.assert_called_once_with("conv-1")
+        self.assertEqual([], self.sent)
+
+    async def test_cjk_characters_are_removed_from_replies(self):
+        with patch.object(bot, "generate_response_with_retry",
+                          AsyncMock(return_value=agent_result("Изделие — рюкзак, для确认 укажите бренд"))):
+            await bot.reply_to_batch(USER, "c", "whatsapp", [{"id": 0, "agent_input": "a"}])
+        self.assertEqual(["Изделие — рюкзак, для укажите бренд"], self.sent)
 
     async def test_batch_stops_before_a_message_still_being_prepared(self):
         text_before = await self.inbound("Вот фото", status="new")
@@ -215,6 +255,19 @@ class MessageQueueTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(bot, "save_feedback", AsyncMock()) as save:
             self.assertTrue(await bot.maybe_save_feedback(USER, "5 всё отлично", "c", "whatsapp"))
         save.assert_awaited_once_with(USER.id, 5, "всё отлично")
+
+        # The model's own follow-up after the request does not cancel the rating request.
+        await database.append_dialog_message(USER.id, "assistant", "text", bot.FEEDBACK_REQUEST_TEXT)
+        await database.append_dialog_message(USER.id, "assistant", "text", "Спасибо за подтверждение!")
+        with patch.object(bot, "save_feedback", AsyncMock()) as save:
+            self.assertTrue(await bot.maybe_save_feedback(USER, "5", "c", "whatsapp"))
+        save.assert_awaited_once_with(USER.id, 5, None)
+
+        await database.append_dialog_message(USER.id, "assistant", "text", bot.FEEDBACK_THANKS_TEXT)
+        with patch.object(bot, "save_feedback", AsyncMock()) as save:
+            # Already rated: a later "5" is not a second rating.
+            self.assertFalse(await bot.maybe_save_feedback(USER, "5", "c", "whatsapp"))
+        save.assert_not_awaited()
 
         await database.append_dialog_message(USER.id, "assistant", "text", bot.GREETING_TEXT)
         with patch.object(bot, "save_feedback", AsyncMock()) as save:
