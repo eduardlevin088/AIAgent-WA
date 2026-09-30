@@ -1,7 +1,7 @@
 {
   "phone": "87717597072",
   "centers": [
-    {"city": "Алматы", "aliases": ["алматы", "алма-ата", "almaty"], "address": "ТРЦ MEGA Alma-Ata, ул. Розыбакиева, 263, 2 этаж"},
+    {"city": "Алматы", "aliases": ["алматы", "алма-ата", "almaty"], "address": "Бутик American Tourister, ТРЦ MEGA Alma-Ata, ул. Розыбакиева, 263, 2 этаж"},
     {"city": "Астана", "aliases": ["астана", "нур-султан", "astana"], "address": "отель Hilton Garden Inn Astana, ул. Кабанбай батыр, 15"}
   ]
 }
