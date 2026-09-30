@@ -351,23 +351,6 @@ def repair_request_title(data: dict) -> str:
     return "ТЕСТ Жалоба" if data.get("complaint") is True else "ТЕСТ Заявка на ремонт"
 
 
-def update_bitrix_repair_request_number(deal_id: int, request_number: int, title: str) -> bool:
-    try:
-        response = requests.post(
-            bitrix_method_url("crm.item.update"),
-            json={
-                "entityTypeId": BITRIX_DEAL_ENTITY_TYPE_ID,
-                "id": deal_id,
-                "fields": {
-                    "TITLE": f"{title} №{request_number}",
-                },
-            },
-        )
-        return response.ok
-    except Exception:
-        return False
-
-
 def get_bitrix_deal_stage_id(deal_id: int) -> str | None:
     if not deal_id:
         return None

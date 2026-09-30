@@ -88,8 +88,7 @@ def manager_working_hours_description() -> str:
 def format_repair_text_minimal(d: dict) -> str:
     return f"""
 Новая заявка на ремонт Samsonite / American Tourister
-Номер заявки: {d.get('request_number') or d.get('deal_id') or 'Не указан'}
-Bitrix ID: {d.get('deal_id') or 'Не указан'}
+Сделка Bitrix: {d.get('deal_id') or 'Не создана'}
 
 Клиент: {d['name']}
 Телефон: {d['phone']}

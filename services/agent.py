@@ -5,9 +5,7 @@ from config import GPT_KEY, GPT_MODEL, AGENT_PROMPT_MAIN_PATH, WARRANTY_RULES_PA
 from config import GPT_SPARE_MODEL, GPT_TRANSCRIPTION_MODEL
 from .miscellaneous import current_time_utc_offset, is_manager_working_time
 from .integrations import create_bitrix_lead, find_bitrix_client_deals
-from .integrations import repair_request_title, update_bitrix_repair_request_number
 from database import create_repair_request, get_bitrix_id, set_bitrix_id, run_coro_on_db_loop
-from database import get_request_numbers_by_deal_ids
 from .service_centers import service_centers_prompt_text
 import json
 import logging
@@ -174,6 +172,11 @@ tools = [
 ]
 
 
+def forget_summary_request(conversation: str) -> None:
+    """The summary was generated but never delivered, so it cannot be confirmed."""
+    _summary_requested_conversations.discard(conversation)
+
+
 def transcribe(voice_buffer: BytesIO) -> str:
     try:
         response = client.audio.transcriptions.create(
@@ -190,7 +193,7 @@ def send_contact_details(data: dict, username: str, user_id: str) -> tuple[str, 
     result = create_bitrix_lead(data, username, bitrix_id)
 
     data["deal_id"] = result["deal_id"]
-    request_number = run_coro_on_db_loop(
+    run_coro_on_db_loop(
         create_repair_request(
             user_id=user_id,
             data=data,
@@ -198,15 +201,14 @@ def send_contact_details(data: dict, username: str, user_id: str) -> tuple[str, 
             bitrix_contact_id=result["bitrix_id"] or bitrix_id,
         )
     )
-    data["request_number"] = request_number
-    if result["deal_id"]:
-        update_bitrix_repair_request_number(
-            result["deal_id"], request_number, repair_request_title(data)
-        )
 
     if result["bitrix_id"]:
         run_coro_on_db_loop(set_bitrix_id(user_id, result["bitrix_id"]))
-    return f"Заявка создана в CRM. Номер заявки: {request_number}", data
+    return (
+        "Заявка создана в CRM. Номер заявки клиенту не называй: его присвоит сервисный центр, "
+        "а узнать его клиент сможет через «Статус заказа».",
+        data,
+    )
 
 
 def get_client_applications(phone: str) -> str:
@@ -231,17 +233,10 @@ def get_client_applications(phone: str) -> str:
         )
 
     deals = deals[:MAX_CLIENT_APPLICATIONS]
-    try:
-        request_numbers = run_coro_on_db_loop(
-            get_request_numbers_by_deal_ids([deal["deal_id"] for deal in deals])
-        )
-    except Exception:
-        logger.exception("Failed to load request numbers for client deals")
-        request_numbers = {}
-
+    # The application number is assigned in Bitrix; the bot has none of its own.
     applications = [
         {
-            "number": deal["number"] or request_numbers.get(deal["deal_id"]),
+            "number": deal["number"],
             "status": deal["status"],
             "created": deal["created"],
         }
@@ -281,7 +276,8 @@ def generate_response(user_message: str | None,
             "input": input_tokens,
             "cache": cache_tokens,
             "output": output_tokens,
-            "response_id": response.id if response else None
+            "response_id": response.id if response else None,
+            "summary_requested": summary_requested_this_turn,
         }
 
     instructions = (

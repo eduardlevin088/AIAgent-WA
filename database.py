@@ -1307,6 +1307,19 @@ async def claim_new_dialog_messages(user_id: str) -> list[dict]:
     return sorted((dict(row) for row in rows), key=lambda row: row["id"])
 
 
+async def has_queued_dialog_messages(user_id: str) -> bool:
+    """True when the user sent something that has not been answered yet."""
+    if db is None:
+        raise RuntimeError("Database not initialized")
+
+    async with db.execute("""
+        SELECT 1 FROM dialog_messages
+        WHERE user_id = ? AND status IN ('preparing', 'new')
+        LIMIT 1
+    """, (user_id,)) as cursor:
+        return await cursor.fetchone() is not None
+
+
 async def cancel_queued_dialog_messages(user_id: str, before_id: int) -> None:
     """Drop queued messages sent before a dialogue restart."""
     if db is None:
@@ -1817,16 +1830,8 @@ async def create_repair_request(
         data.get("warranty_context"),
         data.get("convenient_time"),
     ))
-    request_id = cursor.lastrowid
-    request_number = 10499 + int(request_id)
-
-    await db.execute("""
-        UPDATE repair_requests
-        SET request_number = ?, updated_at = NOW()
-        WHERE id = ?
-    """, (request_number, request_id))
     await db.commit()
-    return request_number
+    return cursor.lastrowid
 
 
 REPAIR_REQUEST_STATUSES = (
@@ -1847,7 +1852,7 @@ async def get_latest_repair_request(user_id: str) -> dict | None:
 
     async with db.execute("""
         SELECT
-            request_number, status, service_type, name, phone, city,
+            deal_id, status, service_type, name, phone, city,
             product_type, brand, model, problem, diagnostic_summary,
             estimated_price_range, warranty_context, convenient_time, created_at
         FROM repair_requests
@@ -1858,24 +1863,6 @@ async def get_latest_repair_request(user_id: str) -> dict | None:
         row = await cursor.fetchone()
 
     return dict(row) if row else None
-
-
-async def get_request_numbers_by_deal_ids(deal_ids: list[int]) -> dict[int, int]:
-    """Map Bitrix deal ids to the bot's request numbers, for deals the bot created."""
-    if db is None:
-        raise RuntimeError("Database not initialized")
-    if not deal_ids:
-        return {}
-
-    placeholders = ", ".join("?" for _ in deal_ids)
-    async with db.execute(f"""
-        SELECT deal_id, request_number
-        FROM repair_requests
-        WHERE deal_id IN ({placeholders}) AND request_number IS NOT NULL
-    """, tuple(deal_ids)) as cursor:
-        rows = await cursor.fetchall()
-
-    return {int(row["deal_id"]): int(row["request_number"]) for row in rows}
 
 
 async def list_repair_requests(
@@ -1897,7 +1884,7 @@ async def list_repair_requests(
         like = f"%{q}%"
         conditions.append("""
             (
-                CAST(request_number AS TEXT) LIKE ?
+                CAST(deal_id AS TEXT) LIKE ?
                 OR user_id LIKE ?
                 OR COALESCE(name, '') LIKE ?
                 OR COALESCE(phone, '') LIKE ?
@@ -1918,7 +1905,7 @@ async def list_repair_requests(
 
     async with db.execute(f"""
         SELECT
-            id, request_number, user_id, deal_id, bitrix_contact_id, status,
+            id, user_id, deal_id, bitrix_contact_id, status,
             furthest_bitrix_stage_id, furthest_bitrix_stage_rank,
             service_type, name, phone, city, product_type, brand, model, article,
             problem, diagnostic_summary, estimated_price_range, warranty_context,
@@ -1970,7 +1957,6 @@ async def list_customers(q: str | None = None, limit: int = 100) -> list[dict]:
             COALESCE(latest.name, u.first_name, u.username, u.user_id) AS display_name,
             COALESCE(latest.phone, u.user_id) AS phone,
             latest.city,
-            latest.request_number AS last_request_number,
             latest.status AS last_status,
             latest.deal_id AS last_deal_id,
             latest.created_at AS last_request_at,
@@ -1996,7 +1982,6 @@ async def list_customers(q: str | None = None, limit: int = 100) -> list[dict]:
             latest.name,
             latest.phone,
             latest.city,
-            latest.request_number,
             latest.status,
             latest.deal_id,
             latest.created_at
@@ -2394,7 +2379,7 @@ async def sync_repair_request_status_by_deal_id(
 
     async with db.execute("""
         SELECT
-            id, request_number, user_id, deal_id, status, name, phone,
+            id, user_id, deal_id, status, name, phone,
             service_type, furthest_bitrix_stage_id, furthest_bitrix_stage_rank,
             created_at, updated_at
         FROM repair_requests
