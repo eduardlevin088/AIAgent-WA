@@ -69,7 +69,7 @@ ENABLE_CHAT_ALLOWLIST=1
 ALLOWED_CHAT_IDS=77767114154,77086975789,77076809448,77474334987,77768305757,77071759248,77027055049
 ```
 
-Inbound messages from any other WhatsApp number are ignored before the bot logs the dialog or sends a reply. New Bitrix repair deals are labeled `ТЕСТ Заявка на ремонт`, then renamed to `ТЕСТ Заявка на ремонт №<номер>` after the local request number is created.
+Inbound messages from any other WhatsApp number are ignored before the bot logs the dialog or sends a reply. New Bitrix deals are titled `Заявка на ремонт` (or `Жалоба` for complaints).
 
 `BITRIX_STAGE_STATUS_MAP` maps Bitrix deal `STAGE_ID` values to local repair statuses. It is optional; default values cover the service center funnel described in `BITRIX.md`.
 

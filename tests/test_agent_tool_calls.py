@@ -271,10 +271,10 @@ class RequestConfirmationTests(unittest.TestCase):
 
 class ComplaintTitleTests(unittest.TestCase):
     def test_regular_application_title(self):
-        self.assertEqual("ТЕСТ Заявка на ремонт", integrations.repair_request_title({"complaint": False}))
+        self.assertEqual("Заявка на ремонт", integrations.repair_request_title({"complaint": False}))
 
     def test_complaint_title(self):
-        self.assertEqual("ТЕСТ Жалоба", integrations.repair_request_title({"complaint": True}))
+        self.assertEqual("Жалоба", integrations.repair_request_title({"complaint": True}))
 
 
 class SendContactDetailsTests(unittest.TestCase):

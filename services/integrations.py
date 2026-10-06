@@ -348,7 +348,7 @@ def repair_problem_text(data: dict) -> str:
 
 
 def repair_request_title(data: dict) -> str:
-    return "ТЕСТ Жалоба" if data.get("complaint") is True else "ТЕСТ Заявка на ремонт"
+    return "Жалоба" if data.get("complaint") is True else "Заявка на ремонт"
 
 
 def get_bitrix_deal_stage_id(deal_id: int) -> str | None:
@@ -478,7 +478,7 @@ def create_bitrix_lead(data: dict, username: str, bitrix_id: int | None) -> dict
                     "stageId": BITRIX_BOT_STAGE_ID,
                     "opened": "Y",
                     "contactId": contact_id,
-                    "sourceId": "AIAgent",
+                    "sourceId": "AIAgent-WA",
                     "ufCrm_696A02431022F": username,
                     "ufCrm_69E34D81BCB10": data["product_type"],
                     "ufCrm_69E35492B27DA": data["model"],
@@ -502,7 +502,7 @@ def create_bitrix_lead(data: dict, username: str, bitrix_id: int | None) -> dict
                     "stageId": BITRIX_BOT_STAGE_ID,
                     "opened": "Y",
                     "contactId": bitrix_id,
-                    "sourceId": "AIAgent",
+                    "sourceId": "AIAgent-WA",
                     "ufCrm_696A02431022F": username,
                     "ufCrm_69E34D81BCB10": data["product_type"],
                     "ufCrm_69E35492B27DA": data["model"],
