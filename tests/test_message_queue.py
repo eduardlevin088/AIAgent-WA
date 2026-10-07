@@ -263,6 +263,21 @@ class MessageQueueTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await bot.maybe_save_feedback(USER, "5", "c", "whatsapp"))
         save.assert_awaited_once_with(USER.id, 5, None)
 
+        # A question after the request: "2" answers it and is not a rating.
+        await database.append_dialog_message(USER.id, "assistant", "text", bot.FEEDBACK_REQUEST_TEXT)
+        await database.append_dialog_message(USER.id, "assistant", "text", "Сколько изделий нужно отремонтировать?")
+        with patch.object(bot, "save_feedback", AsyncMock()) as save:
+            self.assertFalse(await bot.maybe_save_feedback(USER, "2", "c", "whatsapp"))
+        save.assert_not_awaited()
+
+        # A request sent before the deploy, in the old Russian-only wording, still counts.
+        await database.append_dialog_message(
+            USER.id, "assistant", "text", "Оцените, пожалуйста, консультацию: напишите цифру от 1 до 5."
+        )
+        with patch.object(bot, "save_feedback", AsyncMock()) as save:
+            self.assertTrue(await bot.maybe_save_feedback(USER, "4", "c", "whatsapp"))
+        save.assert_awaited_once_with(USER.id, 4, None)
+
         await database.append_dialog_message(USER.id, "assistant", "text", bot.FEEDBACK_THANKS_TEXT)
         with patch.object(bot, "save_feedback", AsyncMock()) as save:
             # Already rated: a later "5" is not a second rating.

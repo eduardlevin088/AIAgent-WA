@@ -78,13 +78,19 @@ wazzup = WazzupClient(outbound_message_recorder=mark_message_processed)
 GREETING_TEXT = GREETING_TEXT_PATH.read_text(encoding="utf-8").strip()
 # The chat accepts any number of photos/videos; only the first ones go to the Bitrix deal.
 BITRIX_MEDIA_LIMIT = 5
-FEEDBACK_REQUEST_TEXT = "Оцените, пожалуйста, консультацию: напишите цифру от 1 до 5."
-FEEDBACK_THANKS_TEXT = "Спасибо за оценку. Отзыв зафиксирован."
-# Includes the earlier wording, so requests sent before a deploy still count.
+# Kazakh first and Russian second, like the greeting.
+FEEDBACK_REQUEST_TEXT = (
+    "Кеңесті 1-ден 5-ке дейін бағалаңызшы: бір цифр жазыңыз.\n"
+    "Оцените, пожалуйста, консультацию: напишите цифру от 1 до 5."
+)
+FEEDBACK_THANKS_TEXT = "Бағаңызға рақмет, пікіріңіз тіркелді.\nСпасибо за оценку. Отзыв зафиксирован."
+# Include the earlier wordings, so requests sent before a deploy still count.
 FEEDBACK_REQUEST_TEXTS = {
     FEEDBACK_REQUEST_TEXT,
+    "Оцените, пожалуйста, консультацию: напишите цифру от 1 до 5.",
     "Оцените, пожалуйста, консультацию от 1 до 5. Можно написать: оценка 5",
 }
+FEEDBACK_THANKS_TEXTS = {FEEDBACK_THANKS_TEXT, "Спасибо за оценку. Отзыв зафиксирован."}
 # How long to wait for the rest of a burst ("Чемодан" / "Самсонайт") before replying.
 RESPONSE_DEBOUNCE_SECONDS = 2.0
 GENERATION_BUSY_RETRY_ATTEMPTS = 3
@@ -1078,14 +1084,15 @@ async def handle_handoff(
 
 
 async def is_awaiting_feedback(user_id: str) -> bool:
-    """True after the rating request until a rating is saved or the dialogue restarts."""
+    """True after the rating request until a rating is saved, the dialogue restarts
+    or the bot asks a new question (a digit after "Сколько изделий?" is an answer)."""
     for row in reversed(await get_recent_dialog(user_id, limit=10)):
         if row["role"] == "user":
             continue
         text = (row["text"] or "").strip()
         if text in FEEDBACK_REQUEST_TEXTS:
             return True
-        if text in (FEEDBACK_THANKS_TEXT, GREETING_TEXT):
+        if text in FEEDBACK_THANKS_TEXTS or text == GREETING_TEXT or "?" in text:
             return False
     return False
 
