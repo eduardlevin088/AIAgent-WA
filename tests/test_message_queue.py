@@ -249,6 +249,39 @@ class MessageQueueTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(await self.statuses(), ["completed"])
 
+    def test_parse_chat_ids_normalizes_numbers(self):
+        self.assertEqual(
+            ["77771234567", "77011112233"],
+            bot.parse_chat_ids("+7 (777) 123-45-67\n87011112233, 77771234567\n\n"),
+        )
+
+    async def test_excluded_chat_is_ignored_completely(self):
+        self.addCleanup(bot.set_excluded_chat_ids, [])
+        allowlist = patch.object(bot, "ENABLE_CHAT_ALLOWLIST", False)
+        allowlist.start()
+        self.addCleanup(allowlist.stop)
+        bot.set_excluded_chat_ids(bot.parse_chat_ids("+7 700 000 00 00"))
+        self.assertFalse(bot.is_allowed_chat(USER.id))
+
+        process_text = AsyncMock()
+        mark_processed = AsyncMock(return_value=True)
+        with (
+            patch.object(bot, "is_dedicated_wazzup_channel", return_value=True),
+            patch.object(bot, "is_manager_outbound_message", return_value=False),
+            patch.object(bot, "is_inbound_customer_message", return_value=True),
+            patch.object(bot, "user_from_message", return_value=USER),
+            patch.object(bot, "mark_message_processed", mark_processed),
+            patch.object(bot, "process_text_message", process_text),
+        ):
+            await bot.process_wazzup_message({"messageId": "m-1", "type": "text", "text": "Здравствуйте"})
+
+        process_text.assert_not_awaited()
+        mark_processed.assert_not_awaited()
+        self.assertEqual(await self.statuses(), [])
+
+        bot.set_excluded_chat_ids([])
+        self.assertTrue(bot.is_allowed_chat(USER.id))
+
     async def test_bare_rating_is_saved_only_as_answer_to_rating_request(self):
         await database.append_dialog_message(USER.id, "assistant", "text", bot.FEEDBACK_REQUEST_TEXT)
         await self.inbound("5")

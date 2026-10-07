@@ -36,6 +36,7 @@ from database import create_customer_segment_job, create_or_update_user, delete_
 from database import execute_query, fail_customer_segment_job, get_admin_ids
 from database import count_active_superadmins, create_admin_user, delete_admin_user_by_id
 from database import get_manager_working_hours_settings, set_manager_working_hours_settings
+from database import get_app_setting, set_app_setting
 from database import get_admin_user_by_id, get_admin_user_by_username, get_customer_segment
 from database import get_analytics_summary, get_handoff_recipient_ids
 from database import get_notification_template_text, get_repair_request_group_stats
@@ -217,6 +218,7 @@ async def lifespan(app: FastAPI):
         end=str(settings["end"]),
         days=set(int(day) for day in settings["days"]),
     )
+    set_excluded_chat_ids(parse_chat_ids(await get_app_setting(EXCLUDED_CHAT_IDS_SETTING, "") or ""))
     for admin_id in ADMIN_IDS:
         await create_admin(admin_id)
 
@@ -462,7 +464,33 @@ def is_customer_greeting(text: str) -> bool:
     return normalized in CUSTOMER_GREETING_PHRASES
 
 
+EXCLUDED_CHAT_IDS_SETTING = "EXCLUDED_CHAT_IDS"
+# Numbers the bot ignores completely, edited in the admin settings. Loaded at
+# startup and replaced on save; the app runs as a single process.
+_excluded_chat_ids: set[str] = set()
+
+
+def parse_chat_ids(raw: str) -> list[str]:
+    """Split numbers by commas, spaces or new lines; "+7 (777) 123-45-67" becomes "77771234567"."""
+    ids = []
+    for line in re.split(r"[,;\n]+", raw):
+        chat_id = normalized_chat_id(line)
+        if len(chat_id) == 11 and chat_id.startswith("8"):
+            chat_id = "7" + chat_id[1:]
+        if chat_id and chat_id not in ids:
+            ids.append(chat_id)
+    return ids
+
+
+def set_excluded_chat_ids(chat_ids: list[str]) -> None:
+    global _excluded_chat_ids
+    _excluded_chat_ids = set(chat_ids)
+
+
 def is_allowed_chat(user_id: str) -> bool:
+    if normalized_chat_id(user_id) in _excluded_chat_ids:
+        return False
+
     if not ENABLE_CHAT_ALLOWLIST:
         return True
 
@@ -2437,8 +2465,23 @@ async def admin_settings(request: Request):
         "working_hours": working_hours,
         "working_days": WORKING_DAYS,
         "working_hours_error": request.query_params.get("working_hours_error"),
+        "excluded_chat_ids": parse_chat_ids(await get_app_setting(EXCLUDED_CHAT_IDS_SETTING, "") or ""),
+        "excluded_saved": request.query_params.get("excluded_saved") == "1",
     })
     return templates.TemplateResponse("admin_settings.html", context)
+
+
+@app.post("/admin/settings/excluded-chats")
+async def admin_settings_excluded_chats(request: Request) -> RedirectResponse:
+    admin = await current_admin(request)
+    if not admin:
+        return RedirectResponse("/admin/login", status_code=303)
+
+    form = await parse_urlencoded_form(request)
+    chat_ids = parse_chat_ids(form.get("excluded_chat_ids") or "")
+    await set_app_setting(EXCLUDED_CHAT_IDS_SETTING, ",".join(chat_ids))
+    set_excluded_chat_ids(chat_ids)
+    return RedirectResponse("/admin/settings?excluded_saved=1", status_code=303)
 
 
 @app.post("/admin/settings/handoff-recipients")

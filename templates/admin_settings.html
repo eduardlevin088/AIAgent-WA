@@ -117,6 +117,7 @@
 
         {% if saved %}<div class="notice" role="status">Получатель сохранён.</div>{% endif %}
         {% if working_hours_saved %}<div class="notice" role="status">Рабочие часы сохранены.</div>{% endif %}
+        {% if excluded_saved %}<div class="notice" role="status">Список исключений сохранён.</div>{% endif %}
         {% if working_hours_error %}
             <div class="notice" role="alert">{{ working_hours_error }}</div>
         {% endif %}
@@ -179,6 +180,18 @@
                     </div>
                 </fieldset>
                 <button type="submit">Сохранить рабочие часы</button>
+            </form>
+
+            <form method="post" action="/admin/settings/excluded-chats">
+                <fieldset>
+                    <legend>Исключённые номера</legend>
+                    <p class="field-help">Бот полностью игнорирует сообщения с этих номеров: не отвечает и не сохраняет их. Менеджеры отвечают им в Wazzup как обычно. По одному номеру на строку, например 77771234567.</p>
+                    <label class="recipient-field">
+                        <span>Номера</span>
+                        <textarea name="excluded_chat_ids" rows="6">{{ (excluded_chat_ids | default([])) | join('\n') }}</textarea>
+                    </label>
+                </fieldset>
+                <button type="submit">Сохранить исключения</button>
             </form>
         </div>
     </main>
