@@ -249,6 +249,58 @@ class MessageQueueTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(await self.statuses(), ["completed"])
 
+    def test_reactions_and_group_chats_are_recognized(self):
+        for text in ("👍", "❤️", "👍🏻😂", ".", "✅ "):
+            self.assertTrue(bot.is_reaction_only(text), text)
+        for text in ("?", "5", "ок 👍", "Сәлем"):
+            self.assertFalse(bot.is_reaction_only(text), text)
+        self.assertTrue(bot.is_group_chat({"chatType": "whatsgroup"}))
+        self.assertFalse(bot.is_group_chat({"chatType": "whatsapp"}))
+
+    async def test_reaction_gets_no_reply(self):
+        generate = AsyncMock(return_value=agent_result("Ответ"))
+        with patch.object(bot, "generate_response_with_retry", generate):
+            await bot.process_text_message(USER, {"text": "👍"}, "test-channel", "whatsapp", None)
+        generate.assert_not_awaited()
+        self.assertEqual(self.sent, [])
+
+    async def test_agent_sees_manager_messages_sent_after_its_last_reply(self):
+        await database.append_dialog_message(USER.id, "operator", "text", "Старое сообщение менеджера")
+        await database.append_dialog_message(USER.id, "assistant", "text", "Ответ бота")
+        await database.append_dialog_message(USER.id, "operator", "text", "Напоминаем, что ваш чемодан готов")
+        message_id = await self.inbound("Когда можно забрать?")
+
+        generate = AsyncMock(return_value=agent_result("Ответ"))
+        with patch.object(bot, "generate_response_with_retry", generate):
+            await bot.enqueue_and_reply(USER, "test-channel", "whatsapp", message_id, "Когда можно забрать?")
+
+        note = generate.await_args.kwargs["system_message"]
+        self.assertIn("Напоминаем, что ваш чемодан готов", note)
+        self.assertNotIn("Старое сообщение менеджера", note)
+        self.assertIn("не начинай новую заявку", note)
+
+    async def test_greeting_does_not_end_a_manager_conversation(self):
+        reset = AsyncMock()
+        manager_active = AsyncMock(return_value=True)
+        with (
+            patch.object(bot, "is_bot_paused", AsyncMock(return_value=True)),
+            patch.object(bot, "has_active_manager_dialog", manager_active),
+            patch.object(bot, "is_dedicated_wazzup_channel", return_value=True),
+            patch.object(bot, "is_manager_outbound_message", return_value=False),
+            patch.object(bot, "is_inbound_customer_message", return_value=True),
+            patch.object(bot, "is_allowed_chat", return_value=True),
+            patch.object(bot, "user_from_message", return_value=USER),
+            patch.object(bot, "mark_message_processed", AsyncMock(return_value=True)),
+            patch.object(bot, "reset_conversation", reset),
+        ):
+            await bot.process_wazzup_message({"messageId": "m-1", "type": "text", "text": "Здравствуйте"})
+            reset.assert_not_awaited()
+
+            # Without a manager in the chat, a greeting still restarts a paused bot.
+            manager_active.return_value = False
+            await bot.process_wazzup_message({"messageId": "m-2", "type": "text", "text": "Здравствуйте"})
+            reset.assert_awaited_once()
+
     def test_parse_chat_ids_normalizes_numbers(self):
         self.assertEqual(
             ["77771234567", "77011112233"],

@@ -1748,6 +1748,19 @@ async def _close_expired_operator_handoffs(
     return closed
 
 
+async def has_active_manager_dialog(user_id: str) -> bool:
+    """True while a manager is talking to the client (their messages keep the handoff active)."""
+    if db is None:
+        raise RuntimeError("Database not initialized")
+
+    async with db.execute("""
+        SELECT 1 FROM operator_handoffs
+        WHERE user_id = ? AND status = 'active'
+        LIMIT 1
+    """, (user_id,)) as cursor:
+        return await cursor.fetchone() is not None
+
+
 async def cancel_open_operator_handoff(user_id: str) -> int:
     if db is None:
         raise RuntimeError("Database not initialized")

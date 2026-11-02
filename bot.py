@@ -36,7 +36,7 @@ from database import create_customer_segment_job, create_or_update_user, delete_
 from database import execute_query, fail_customer_segment_job, get_admin_ids
 from database import count_active_superadmins, create_admin_user, delete_admin_user_by_id
 from database import get_manager_working_hours_settings, set_manager_working_hours_settings
-from database import get_app_setting, set_app_setting
+from database import get_app_setting, has_active_manager_dialog, set_app_setting
 from database import get_admin_user_by_id, get_admin_user_by_username, get_customer_segment
 from database import get_analytics_summary, get_handoff_recipient_ids
 from database import get_notification_template_text, get_repair_request_group_stats
@@ -432,6 +432,11 @@ def is_manager_outbound_message(message: dict[str, Any]) -> bool:
         and not message.get("isDeleted")
         and not message.get("isEdited")
     )
+
+
+def is_group_chat(message: dict[str, Any]) -> bool:
+    """WhatsApp/Telegram/Max group chats ("whatsgroup", "telegroup", "maxgroup")."""
+    return str(message.get("chatType") or "").endswith("group")
 
 
 def is_dedicated_wazzup_channel(message: dict[str, Any]) -> bool:
@@ -1125,6 +1130,11 @@ async def is_awaiting_feedback(user_id: str) -> bool:
     return False
 
 
+def is_reaction_only(text: str) -> bool:
+    """Emoji-only text, which is how Wazzup delivers reactions ("👍", "❤️"). A bare "?" still gets a reply."""
+    return not re.search(r"[\w?]", text)
+
+
 def parse_bare_rating(text: str) -> tuple[int, str | None] | None:
     """Parse a reply to the rating request: "5", "5/5", "5 всё отлично" or "⭐⭐⭐⭐⭐"."""
     stars = text.replace("\ufe0f", "").replace(" ", "")
@@ -1196,6 +1206,32 @@ async def enqueue_and_reply(
             await set_dialog_messages_status([row["id"] for row in batch], "completed")
 
 
+MANAGER_NOTE_MAX_MESSAGES = 5
+MANAGER_NOTE_MAX_CHARS = 600
+
+
+def manager_messages_note(dialog: list[dict[str, Any]]) -> str | None:
+    """Manager and CRM messages sent after the bot's last reply, which the model has not seen."""
+    texts: list[str] = []
+    for row in reversed(dialog):
+        if row["role"] == "assistant":
+            break
+        if row["role"] == "operator" and (row.get("text") or "").strip():
+            texts.append(row["text"].strip()[:MANAGER_NOTE_MAX_CHARS])
+    if not texts:
+        return None
+    quoted = "\n---\n".join(reversed(texts[:MANAGER_NOTE_MAX_MESSAGES]))
+    return (
+        "После твоего последнего ответа клиенту писал менеджер или CRM "
+        "(уведомление о статусе, напоминание о готовом изделии и т.п.):\n"
+        f"{quoted}\n\n"
+        "Клиент, скорее всего, отвечает на эти сообщения. Если речь о существующей заявке "
+        "или готовом изделии, не начинай новую заявку и не проси фото: коротко ответь по "
+        "контексту (адрес, часы работы, как забрать). Если нужного ответа нет в сценарии, "
+        "передай вопрос менеджеру."
+    )
+
+
 def merge_batch(batch: list[dict[str, Any]]) -> tuple[str | None, str | None]:
     user_message = "\n".join(row["agent_input"] for row in batch if row.get("agent_input")) or None
 
@@ -1231,6 +1267,9 @@ async def reply_to_batch(
     epoch = _user_conversation_epochs.get(user.id, 0)
     conversation = await ensure_conversation(user)
     user_message, system_message = merge_batch(batch)
+    manager_note = manager_messages_note(await get_recent_dialog(user.id, limit=30))
+    if manager_note:
+        system_message = manager_note + ("\n\n" + system_message if system_message else "")
     superseded = user.id in _user_superseded_replies
     _user_superseded_replies.discard(user.id)
     if superseded:
@@ -1467,6 +1506,10 @@ async def process_text_message(
     if await maybe_save_feedback(user, text, channel_id, chat_type):
         return
 
+    if is_reaction_only(text):
+        await log_event(user.id, "reaction_ignored", text)
+        return
+
     if text.startswith("/") and await handle_command(user, channel_id, chat_type, text, dialog_message_id):
         return
 
@@ -1508,12 +1551,12 @@ async def process_image_message(
         )
 
     system_message = (
-        "Пользователь только что отправил фото повреждения. "
+        "Пользователь только что отправил фото. "
         "Фото успешно получено и будет прикреплено к заявке. "
-        "Спроси клиента: будет ли он отправлять ещё фотографии? "
-        "Если клиент говорит, что больше фото не будет, переходи к следующему шагу заявки. "
-        "НЕ упоминай техническую сторону (что фото 'направится автоматически' и т.п.) — "
-        "просто подтверди получение и спроси про дополнительные фото."
+        "Коротко подтверди получение и переходи к следующему недостающему шагу заявки. "
+        "Не спрашивай, будет ли клиент отправлять ещё фото: если пришлёт, они тоже прикрепятся. "
+        "Дополнительное фото проси только если повреждение на фото не видно, и только один раз за заявку. "
+        "НЕ упоминай техническую сторону (что фото 'направится автоматически' и т.п.)."
     )
     if photo_analysis:
         system_message += f"\n\n{photo_analysis.as_agent_context()}"
@@ -1539,7 +1582,8 @@ async def process_video_message(
     system_message = (
         "Пользователь только что отправил видео повреждения. "
         "Видео успешно получено и будет прикреплено к заявке. "
-        "Подтверди получение и спроси, будет ли клиент отправлять ещё фото или видео."
+        "Коротко подтверди получение и переходи к следующему недостающему шагу заявки. "
+        "Не спрашивай, будет ли клиент отправлять ещё фото или видео."
     )
     await enqueue_and_reply(
         user=user,
@@ -1638,7 +1682,7 @@ async def process_manager_outbound_message(message: dict[str, Any]) -> None:
 
 
 async def process_wazzup_message(message: dict[str, Any]) -> None:
-    if not is_dedicated_wazzup_channel(message):
+    if not is_dedicated_wazzup_channel(message) or is_group_chat(message):
         return
 
     if is_manager_outbound_message(message):
@@ -1677,7 +1721,11 @@ async def process_wazzup_message(message: dict[str, Any]) -> None:
 
         if message_type == "text":
             text = message.get("text") or ""
-            can_restart = is_customer_greeting(text) or text.startswith(("/start", "/resume"))
+            # A greeting restarts a paused bot only while no manager is talking
+            # to the client; otherwise "Здравствуйте" would cut into their chat.
+            can_restart = text.startswith(("/start", "/resume")) or (
+                is_customer_greeting(text) and not await has_active_manager_dialog(user.id)
+            )
             if await is_bot_paused(user.id) and not can_restart:
                 await log_event(user.id, "message_while_paused", message_id)
                 return
